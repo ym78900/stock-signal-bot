@@ -1,0 +1,12 @@
+yfinance>=1.2.0
+pandas==2.2.2
+ta==0.11.0
+python-telegram-bot==20.7
+APScheduler==3.10.4
+matplotlib==3.8.4
+python-dotenv==1.0.1
+pytz==2024.1
+lxml==5.2.2
+html5lib==1.1
+beautifulsoup4==4.12.3
+requests==2.31.0
