@@ -33,6 +33,7 @@ their IBKR account — the bot does NOT execute trades automatically.
 | S&P 500 source | Wikipedia scrape with User-Agent header | Free, no API key, auto-updates |
 | yfinance fetch | `period="60d", interval="1d"` | 60 days covers 50-day MA comfortably |
 | Data library | yfinance (unofficial Yahoo Finance) | Free, reliable for daily candles |
+| Real-time price | Alpaca Market Data API (free tier) | Real-time price for `/signal` command via websocket |
 | Indicators | `ta` library (NOT pandas-ta) | pandas-ta dropped Python 3.9 support |
 | State storage | Local JSON file (`watchlist.json`) | Simple, no database needed |
 | Scheduling | 2 APScheduler jobs only | Morning scan + end-of-day signal check |
@@ -146,8 +147,9 @@ stock-signal-bot/
 
 | Component | Library | Version |
 |---|---|---|
-| Language | Python | 3.9 (machine constraint) |
-| Market data | yfinance | 1.2.0+ |
+| Language | Python | 3.9 (machine constraint — do NOT use 3.14+) |
+| Market data (daily) | yfinance | 1.2.0+ |
+| Real-time price | alpaca-py | 0.43.0+ |
 | Data processing | pandas | 2.2.2 |
 | Indicators | ta | 0.11.0 |
 | Telegram | python-telegram-bot | 20.7 |
@@ -162,13 +164,16 @@ stock-signal-bot/
 ```bash
 # 1. Install dependencies
 cd ~/Desktop/stock-signal-bot
-pip3 install -r requirements.txt
+/Library/Developer/CommandLineTools/usr/bin/python3.9 -m pip install -r requirements.txt
 
-# 2. .env is already filled in (token + channel ID set)
+# 2. .env is already filled in (Telegram token + channel ID + Alpaca keys)
 
 # 3. Run the bot
-python3 main.py
+/Library/Developer/CommandLineTools/usr/bin/python3.9 main.py
 ```
+
+> IMPORTANT: Always use Python 3.9 explicitly. The system `python3` points to 3.14
+> which breaks python-telegram-bot 20.7.
 
 The bot will log its schedule and wait for the next scheduled job time.
 
@@ -178,16 +183,19 @@ The bot will log its schedule and wait for the next scheduled job time.
 
 - [x] All files written and complete
 - [x] Dependencies installed
-- [x] `.env` filled in with real Telegram token and channel ID
+- [x] `.env` filled in with Telegram token, channel ID, and Alpaca API keys
 - [x] Bot connects to Telegram successfully
 - [x] Signal logic tested — AAPL returned correct RSI/MA values
 - [x] Wikipedia 403 fix applied (User-Agent header in requests)
 - [x] Python 3.9 type hint fixes applied (`Optional` instead of `X | None`)
 - [x] yfinance MultiIndex column fix applied (newer yfinance returns MultiIndex)
+- [x] Real-time price via Alpaca added to `/signal` command
+- [x] Fallback to yfinance price if Alpaca unavailable
+- [x] Price note in signal message shows whether price is real-time or delayed
+- [x] Project pushed to GitHub (https://github.com/ym78900/stock-signal-bot)
 - [ ] Full end-to-end test completed (watchlist posted to channel)
 - [ ] Signals validated over 1 week of observation
-- [ ] Schedule reset to production times (currently set to test times)
-- [ ] (Future) IBKR TWS API connected for real-time data
+- [ ] (Future) IBKR TWS API connected
 - [ ] (Future) Auto-execution via IBKR with Telegram approval button
 
 ---
@@ -200,6 +208,7 @@ The bot will log its schedule and wait for the next scheduled job time.
 | `X \| None` type hints fail on Python 3.9 | Replaced with `Optional[X]` from `typing` | All files |
 | yfinance returns MultiIndex DataFrame | Added `.get_level_values(0)` flatten | `scanner.py`, `signals.py` |
 | Wikipedia returns 403 Forbidden | Added `User-Agent` header via `requests` | `scanner.py` |
+| `python3` on mac points to 3.14 — breaks PTB 20.7 | Use `/Library/Developer/CommandLineTools/usr/bin/python3.9` explicitly | — |
 
 ---
 

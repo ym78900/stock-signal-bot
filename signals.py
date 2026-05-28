@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional, List
 import pandas as pd
 import yfinance as yf
@@ -7,6 +8,95 @@ import ta as ta_lib
 import config
 
 logger = logging.getLogger(__name__)
+
+# ── In-memory asset cache ─────────────────────────────────────────────────────
+_asset_cache: List[dict] = []
+
+def load_asset_cache() -> None:
+    """
+    Pre-load all tradable US equity assets from Alpaca into memory.
+    Call this once at bot startup. All searches are then instant.
+    """
+    global _asset_cache
+    try:
+        from alpaca.trading.client import TradingClient
+        from alpaca.trading.requests import GetAssetsRequest
+        from alpaca.trading.enums import AssetClass
+
+        api_key    = os.environ.get("ALPACA_API_KEY")
+        secret_key = os.environ.get("ALPACA_SECRET_KEY")
+        if not api_key or not secret_key:
+            return
+
+        client = TradingClient(api_key, secret_key, paper=True)
+        assets = client.get_all_assets(GetAssetsRequest(asset_class=AssetClass.US_EQUITY))
+        _asset_cache = [
+            {"ticker": a.symbol, "name": a.name}
+            for a in assets if a.tradable
+        ]
+        logger.info(f"Asset cache loaded: {len(_asset_cache)} tradable US equities.")
+    except Exception as e:
+        logger.warning(f"Could not load asset cache: {e}")
+
+
+def search_tickers(query: str, max_results: int = 10) -> list:
+    """
+    Search cached assets by ticker or name. Instant after cache is loaded.
+    Falls back to a live Alpaca call if cache is empty.
+    """
+    global _asset_cache
+    if not _asset_cache:
+        load_asset_cache()
+
+    q = query.lower()
+    results = [
+        a for a in _asset_cache
+        if q in a["ticker"].lower() or q in a["name"].lower()
+    ]
+    results.sort(key=lambda x: (x["ticker"].lower() != q, x["ticker"]))
+    return results[:max_results]
+
+
+def get_company_name(ticker: str) -> Optional[str]:
+    """Look up a single ticker's company name from Alpaca."""
+    try:
+        from alpaca.trading.client import TradingClient
+        from alpaca.trading.enums import AssetClass
+
+        api_key    = os.environ.get("ALPACA_API_KEY")
+        secret_key = os.environ.get("ALPACA_SECRET_KEY")
+        if not api_key or not secret_key:
+            return None
+
+        client = TradingClient(api_key, secret_key, paper=True)
+        asset  = client.get_asset(ticker)
+        return asset.name if asset else None
+    except Exception as e:
+        logger.warning(f"Could not fetch company name for {ticker}: {e}")
+        return None
+
+
+def fetch_realtime_price(ticker: str) -> Optional[float]:
+    """Fetch real-time price from Alpaca. Returns None if unavailable."""
+    try:
+        from alpaca.data import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest
+
+        api_key    = os.environ.get("ALPACA_API_KEY")
+        secret_key = os.environ.get("ALPACA_SECRET_KEY")
+        if not api_key or not secret_key:
+            return None
+
+        client  = StockHistoricalDataClient(api_key, secret_key)
+        request = StockLatestTradeRequest(symbol_or_symbols=ticker)
+        trade   = client.get_stock_latest_trade(request)
+
+        if ticker in trade:
+            return round(float(trade[ticker].price), 2)
+        return None
+    except Exception as e:
+        logger.warning(f"Alpaca real-time price fetch failed for {ticker}: {e}")
+        return None
 
 
 def fetch_ticker_data(ticker: str) -> Optional[pd.DataFrame]:
@@ -35,7 +125,7 @@ def fetch_ticker_data(ticker: str) -> Optional[pd.DataFrame]:
         return None
 
 
-def analyse(ticker: str, df: pd.DataFrame) -> dict:
+def analyse(ticker: str, df: pd.DataFrame, company_name: Optional[str] = None) -> dict:
     """
     Run RSI + MA analysis on a daily DataFrame.
 
@@ -55,6 +145,7 @@ def analyse(ticker: str, df: pd.DataFrame) -> dict:
     """
     result = {
         "ticker":        ticker,
+        "company_name":  company_name or get_company_name(ticker),
         "price":         None,
         "rsi":           None,
         "ma_fast":       None,
@@ -69,7 +160,10 @@ def analyse(ticker: str, df: pd.DataFrame) -> dict:
 
     try:
         # ── Price + last candle date ──────────────────────────────────────────
-        result["price"] = round(float(df["Close"].iloc[-1]), 2)
+        eod_price = round(float(df["Close"].iloc[-1]), 2)
+        realtime_price = fetch_realtime_price(ticker)
+        result["price"] = realtime_price if realtime_price else eod_price
+        result["realtime"] = realtime_price is not None
         result["last_candle"] = str(df.index[-1].date())
 
         # ── RSI ───────────────────────────────────────────────────────────────

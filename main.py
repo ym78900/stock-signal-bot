@@ -98,6 +98,10 @@ async def main():
 
     logger.info("Starting Stock Signal Bot...")
 
+    # Pre-load Alpaca asset cache for fast ticker search
+    logger.info("Loading asset cache from Alpaca...")
+    sig.load_asset_cache()
+
     # Build Telegram application
     app = tbot.build_application(token)
     bot = app.bot

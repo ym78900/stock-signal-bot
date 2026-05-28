@@ -1,5 +1,6 @@
 .env
 watchlist.json
+custom_watchlist.json
 __pycache__/
 *.pyc
 *.pyo

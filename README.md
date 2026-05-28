@@ -61,7 +61,7 @@ When a signal fires, the channel gets a message like this:
 ```
 SIGNAL — BUY
 Stock:  NVDA
-Price:  $875.20
+Price:  $875.20  (real-time price)
 RSI:    27.4 (oversold)
 MA:     20MA crossed above 50MA
 Time:   11:15 PM Finnish time
@@ -94,7 +94,7 @@ The bot responds to commands:
 | Command | What happens |
 |---|---|
 | `/watchlist` | Shows today's top 10 stocks |
-| `/signal NVDA` | Shows live RSI and moving average status for any stock |
+| `/signal NVDA` | Shows real-time price, RSI and moving average status for any stock |
 | `/chart NVDA` | Sends a price chart with all indicators as an image |
 | `/status` | Shows whether the bot is running and when the next scan is |
 
@@ -108,8 +108,20 @@ This bot is **signals only** — it tells me what looks interesting, I decide wh
 
 ## Tech behind it
 
-- Built in Python, runs on my Mac
-- Stock data from Yahoo Finance (free, public)
+- Built in Python 3.9, runs on my Mac
+- Real-time stock prices from Alpaca Markets (free)
+- RSI & MA indicators from Yahoo Finance daily candles (free)
 - Signals delivered via Telegram
 - Scans all 500 S&P 500 companies every day
 - No subscriptions, no paid APIs
+
+---
+
+## Running the bot
+
+```bash
+cd ~/Desktop/stock-signal-bot
+/Library/Developer/CommandLineTools/usr/bin/python3.9 main.py
+```
+
+> Use Python 3.9 specifically — newer versions (3.14+) are not compatible with python-telegram-bot 20.7.
