@@ -1,5 +1,7 @@
 import logging
 import os
+import asyncio
+import threading
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)
@@ -8,6 +10,8 @@ logger = logging.getLogger(__name__)
 def get_positions() -> Optional[List[dict]]:
     """
     Connect to IB Gateway, fetch all open positions, disconnect.
+    Runs ib_insync in a separate thread with its own event loop to avoid
+    conflicting with the Telegram bot's running event loop.
 
     Returns a list of dicts:
       [
@@ -21,42 +25,57 @@ def get_positions() -> Optional[List[dict]]:
       ]
     Returns None if IB Gateway is not reachable.
     """
-    try:
-        from ib_insync import IB, util
-        util.logToConsole(level=logging.WARNING)  # suppress ib_insync noise
+    result = []
+    error = []
 
-        host = os.environ.get("IBKR_HOST", "127.0.0.1")
-        port = int(os.environ.get("IBKR_PORT", "4002"))  # 4002 = IB Gateway paper, 7497 = TWS paper
-        client_id = int(os.environ.get("IBKR_CLIENT_ID", "10"))
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            from ib_insync import IB, util
+            util.logToConsole(level=logging.WARNING)
 
-        ib = IB()
-        ib.connect(host, port, clientId=client_id, timeout=5, readonly=True)
+            host = os.environ.get("IBKR_HOST", "127.0.0.1")
+            port = int(os.environ.get("IBKR_PORT", "4001"))
+            client_id = int(os.environ.get("IBKR_CLIENT_ID", "10"))
 
-        raw_positions = ib.positions()
-        ib.disconnect()
+            ib = IB()
+            ib.connect(host, port, clientId=client_id, timeout=5, readonly=True)
 
-        positions = []
-        for p in raw_positions:
-            ticker = p.contract.symbol
-            shares = float(p.position)
-            avg_cost = round(float(p.avgCost), 2)
-            market_val = round(shares * avg_cost, 2)
+            raw_positions = ib.positions()
+            ib.disconnect()
 
-            if shares == 0:
-                continue
+            for p in raw_positions:
+                ticker = p.contract.symbol
+                shares = float(p.position)
+                avg_cost = round(float(p.avgCost), 2)
+                market_val = round(shares * avg_cost, 2)
 
-            positions.append({
-                "ticker":     ticker,
-                "shares":     shares,
-                "avg_cost":   avg_cost,
-                "market_val": market_val,
-            })
+                if shares == 0:
+                    continue
 
-        return positions
+                result.append({
+                    "ticker":     ticker,
+                    "shares":     shares,
+                    "avg_cost":   avg_cost,
+                    "market_val": market_val,
+                })
+        except ConnectionRefusedError:
+            error.append("connection_refused")
+        except Exception as e:
+            error.append(str(e))
+        finally:
+            loop.close()
 
-    except ConnectionRefusedError:
-        logger.warning("IBKR: Connection refused — is IB Gateway running?")
+    t = threading.Thread(target=_run)
+    t.start()
+    t.join(timeout=15)
+
+    if error:
+        if error[0] == "connection_refused":
+            logger.warning("IBKR: Connection refused — is IB Gateway running?")
+        else:
+            logger.warning(f"IBKR error: {error[0]}")
         return None
-    except Exception as e:
-        logger.warning(f"IBKR error: {e}")
-        return None
+
+    return result
