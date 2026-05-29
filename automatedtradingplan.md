@@ -76,9 +76,10 @@ SELL: RSI > 70  AND  (20MA < 50MA  OR  death cross today)
 - Never open more than 5 positions simultaneously
 
 ### Risk management rules
-- Daily loss limit: if portfolio drops 3% in one day → stop all trading for that day
-- Per trade max loss: stop loss always set before entry
+- Per trade max loss: stop loss always set before entry (ATR × 1.5)
 - Never trade within 3 days of earnings (Phase 3)
+- Stop trading after 3 consecutive losses — counter resets after a winning trade, not daily
+- No hard daily % loss limit — per-trade stop losses provide sufficient protection
 
 ---
 
@@ -122,7 +123,7 @@ TRADING_MODE = "automatic"       # "automatic" or "manual"
 PAPER_TRADING = True             # True = Alpaca paper, False = IBKR live
 MAX_POSITION_PCT = 0.10          # 10% of portfolio per trade
 MAX_OPEN_POSITIONS = 5
-DAILY_LOSS_LIMIT_PCT = 0.03      # Stop trading if portfolio drops 3% in one day
+CONSECUTIVE_LOSS_LIMIT = 3       # Stop trading after 3 losses in a row (resets after a win)
 ATR_PERIOD = 14                  # ATR lookback period
 ATR_STOP_MULTIPLIER = 1.5        # Stop loss = entry - (ATR × 1.5)
 ATR_TARGET_MULTIPLIER = 3.0      # Take profit = entry + (ATR × 3.0)
@@ -271,6 +272,10 @@ to measure the isolated impact of each one using trade history.**
 
 ### Phase 4 — Backtesting Engine
 
+**IMPORTANT: This is actually Step 1 — build and run this BEFORE everything else.
+The full plan may change based on backtest results. Do not build auto-execution
+or intraday scanning until backtest confirms the strategy has positive expected value.**
+
 **Goal:** Test the strategy against 2+ years of historical S&P 500 data
 to validate performance before risking real capital and to find optimal thresholds.
 
@@ -296,6 +301,59 @@ to validate performance before risking real capital and to find optimal threshol
 - Run backtest across MA periods (10/30, 20/50, 20/100)
 - Find combination with best risk-adjusted return
 - Report best settings found to Telegram
+
+---
+
+### Phase 4b — Intraday Scanning (15-min candles)
+
+**Goal:** Scan all 500 S&P stocks every 15 minutes during market hours using
+Alpaca bulk API. Add VWAP as primary intraday confirmation.
+Only build after Phase 3 confirmations are validated by backtest.
+
+**Market hours (Finnish time):** 4:30 PM – 11:00 PM
+
+**Data source:** Alpaca bulk snapshot API — fetches all 500 stocks in a single
+API call. Much faster than yfinance for intraday. Already set up in .env.
+
+**Intraday signal logic:**
+```
+BUY  signal: RSI < 30 on 15-min candle
+             AND price above VWAP
+             AND volume spike (> 1.5x average intraday volume)
+
+SELL signal: RSI > 70 on 15-min candle
+             AND price below VWAP
+```
+
+**Critical VWAP rule:**
+VWAP resets every day at market open. Intraday signals using VWAP context
+are only valid same-day. They NEVER carry over to next day open.
+- Intraday BUY signal fires at 7:00 PM Finnish → order executes immediately (market is open)
+- End-of-day BUY signal fires at 11:15 PM Finnish → order waits for next morning open with time_in_force="day"
+- These are two separate execution paths — never mix them
+
+**Consecutive loss counter:**
+- Shared between intraday and end-of-day trades
+- Resets after any winning trade (not daily)
+- Stop all trading after 3 consecutive losses regardless of source
+
+**Files to modify for intraday:**
+- `scanner.py` — add `run_intraday_scan()` function using Alpaca bulk snapshot
+- `signals.py` — add `analyse_intraday(ticker, bars_15min)` function with VWAP
+- `main.py` — add intraday scheduler job every 15 min during market hours
+- `config.py` — add intraday config constants
+
+**New config values for intraday:**
+```python
+INTRADAY_INTERVAL_MINUTES = 15
+INTRADAY_RSI_PERIOD = 14
+INTRADAY_RSI_BUY = 30
+INTRADAY_RSI_SELL = 70
+INTRADAY_VOLUME_SPIKE = 1.5      # Volume must be 1.5x intraday average
+MARKET_OPEN_HOUR_ET = 9          # 9:30 AM ET = 4:30 PM Finnish
+MARKET_OPEN_MINUTE_ET = 30
+MARKET_CLOSE_HOUR_ET = 16        # 4:00 PM ET = 11:00 PM Finnish
+```
 
 ---
 
@@ -405,7 +463,7 @@ stock-signal-bot/
 | Auto mode default, manual toggle | User wants automation; manual mode available as safety option |
 | Max 10% portfolio per trade | Prevents overexposure to single position |
 | Max 5 open positions | Keeps risk manageable, ensures capital always available |
-| Daily loss limit 3% | Stops runaway losses on bad market days |
+| Daily loss limit 3% | Replaced with consecutive loss limit — smarter, doesn't block afternoon trades |
 | Start with current 2 confirmations | Collect real data first, add more filters based on evidence |
 
 ---
