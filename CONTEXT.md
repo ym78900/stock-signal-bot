@@ -7,36 +7,42 @@ without re-explaining anything. Read this fully before making any changes.
 
 ## What this project is
 
-A Python Telegram bot that runs on a personal computer, scans the S&P 500 every day,
-and posts stock BUY/SELL signals to a Telegram channel. The user acts manually via
-their IBKR account — the bot does NOT execute trades automatically.
+A fully automated Python swing trading bot that:
+- Scans S&P 500 + NASDAQ-100 (~600 tickers) every trading day
+- Places bracket orders (entry + stop loss + take profit) automatically on Alpaca paper trading
+- Monitors open positions and notifies via Telegram when a stop or target is hit
+- Posts weekly performance reports to a private Telegram channel
+
+**The bot executes trades automatically. The user does not act manually.**
 
 ---
 
 ## Owner context
 
 - **Location:** Finland (Finnish time = UTC+3 summer / UTC+2 winter, always ET+7)
-- **Broker:** IBKR (Interactive Brokers) — not connected yet, planned for future
+- **Broker:** Alpaca (paper) → IBKR (planned for live)
 - **Experience:** Node.js background, learning Python
-- **Trading mode:** Signals only, user acts manually
+- **Trading mode:** Fully automated — bracket orders placed via Alpaca paper API
 
 ---
 
-## Key decisions already made (do not re-debate these)
+## Key decisions (do not re-debate these)
 
 | Topic | Decision | Reason |
 |---|---|---|
-| RSI timeframe | Daily candles only (`interval="1d"`) | Reliable, no noise, matches manual trading pace |
-| MA crossover | 20-day MA vs 50-day MA | Classic swing trading indicator |
-| Intraday scanning | None | Daily RSI doesn't change intraday — no value |
+| RSI timeframe | Daily candles only (`interval="1d"`) | Reliable, matches swing hold periods |
 | Signal timing | Post-close only (11:15 PM Finnish) | New daily candles finalize at market close |
-| S&P 500 source | Wikipedia scrape with User-Agent header | Free, no API key, auto-updates |
-| yfinance fetch | `period="60d", interval="1d"` | 60 days covers 50-day MA comfortably |
+| Universe | S&P 500 + NASDAQ-100 (~600 tickers) | NASDAQ-100 adds key $5–$50 volatile stocks |
+| Price filter | Hard skip below $5 or above $150 | Prevents 1-share position blowups (AZO bug) |
+| Position sizing | ATR-based `calculate_position_size()` targeting $40/trade, 15% hard cap | Replaces broken `max(1, int(...))` formula |
+| Min shares | 3 shares minimum | Skip trade if can't buy ≥3 within position cap |
 | Data library | yfinance (unofficial Yahoo Finance) | Free, reliable for daily candles |
-| Real-time price | Alpaca Market Data API (free tier) | Real-time price for `/signal` command via websocket |
+| Real-time price | Alpaca Market Data API (free tier) | For `/signal` command |
 | Indicators | `ta` library (NOT pandas-ta) | pandas-ta dropped Python 3.9 support |
-| State storage | Local JSON file (`watchlist.json`) | Simple, no database needed |
-| Scheduling | 2 APScheduler jobs only | Morning scan + end-of-day signal check |
+| State storage | Local JSON (atomic writes via `os.replace`) | Simple, race-condition safe |
+| Intraday | Permanently shelved | Backtested — swing wins on every metric |
+| ATR-based exits | Stop × 3.5, Target × 6.0 | Confirmed best across 3-round backtest framework |
+| MACD | Permanently dropped | Mutually exclusive with oversold RSI — 0 trades |
 
 ---
 
@@ -48,53 +54,108 @@ Market Open:   4:30 PM – 11:00 PM Finnish time  ← main session
 After-Hours:  11:00 PM – 3:00 AM  Finnish time (next day)
 ```
 
-Offset is always ET+7 (both summer and winter — Finnish DST and US DST cancel out).
+Offset is always ET+7 (Finnish DST and US DST cancel out).
 
 ---
 
 ## Daily Bot Schedule (Finnish time)
 
 ```
-4:00 PM  → Fetch daily data for all 500 S&P stocks (prior-day close data)
-           → Score + rank all 500 → pick top 10
-4:20 PM  → Post "Today's Watchlist" to Telegram channel
-           (bot sleeps during market hours — daily RSI doesn't change intraday)
-11:00 PM → Market closes — new daily candles finalize
-11:15 PM → Fetch updated daily data for top 10 only
-           → Run RSI + MA crossover signal check
-           → Post any BUY/SELL signals to channel
-           → Post daily summary to channel
+4:00 PM  → Morning scan: score all ~600 S&P500+NASDAQ100 stocks, pick top 50
+4:20 PM  → Post watchlist to Telegram channel
+4:25 PM  → Execute pending trades (9:25 AM ET, 5 min before open):
+             Check VIX + SPY circuit breakers
+             Per-ticker: earnings check, position limits, consecutive loss limit
+             qty = calculate_position_size(entry_price, atr, target_mult=6.0, profit_target=$40, cap=15%)
+             Place bracket order: market buy + SL@(entry−ATR×3.5) + TP@(entry+ATR×6.0)
+             Log to trades.csv, post confirmation to Telegram
+4:30–11:00 PM → Monitor positions every 15 min (market hours)
+11:15 PM → Auto-scan ALL ~600 tickers: RSI + volume filter
+             Queue valid BUY signals to pending_trades.json
+             Post "X trades queued for tomorrow" to Telegram
+Sunday 8 PM → Weekly performance report
 ```
 
 ---
 
 ## Signal Logic
 
-### Layer 1 — Morning Screener (4:00 PM)
-Scores every S&P 500 stock on 3 dimensions:
-
+### Morning screener (4:00 PM)
+Scores each stock on 3 dimensions:
 ```
-Volume score    (35%) = today's volume / 20-day avg volume, capped at 5x → 1.0
-RSI score       (40%) = |RSI - 50| / 20, capped at 1.0  (distance from neutral)
+Volume score    (35%) = today's volume / 20-day avg volume, capped at 5× → 1.0
+RSI score       (40%) = |RSI - 50| / 20, capped at 1.0
 Momentum score  (25%) = |5-day % price change| / 10%, capped at 1.0
++ 0.10 bonus if price in $5–$50 range (preferred cheap stocks)
+```
+Stocks below $5 or above $150 are hard-filtered out before scoring.
+Stocks with average volume < 200K/day are hard-filtered out.
+
+### Auto-scan signal engine (11:15 PM)
+```
+BUY signal fires when ALL of:
+  RSI(14) < 38                    — oversold on daily candles
+  Volume > 1.2× 20-day avg        — confirmed interest
+  Price in $5–$150                — within tradeable range
+  SPY above 50MA                  — bull market condition
+  VIX < 25                        — not a fear/volatility spike
+  No earnings within 3 days       — avoid event risk
+  20MA > 50MA (or golden cross)   — uptrend confirmed
 ```
 
-Top 10 by composite score → saved to `watchlist.json`.
+---
 
-### Layer 2 — Signal Engine (11:15 PM)
-For each of the 10 watchlist stocks:
+## Strategy Parameters (locked — confirmed by 4-round backtesting)
 
+```python
+RSI_BUY_THRESHOLD         = 38
+RSI_PERIOD                = 14
+VOLUME_CONFIRMATION_RATIO = 1.2
+ATR_PERIOD                = 14
+ATR_STOP_MULTIPLIER       = 3.5
+ATR_TARGET_MULTIPLIER     = 6.0
+
+MAX_POSITION_PCT          = 0.12   # used in backtester baseline only
+MAX_POSITION_PCT_HARD_CAP = 0.15   # live hard cap (15% of equity max per trade)
+MAX_OPEN_POSITIONS        = 5
+CONSECUTIVE_LOSS_LIMIT    = 3
+DAILY_PROFIT_TARGET       = 40.0   # target $ per winning trade for sizing
+
+PRICE_MIN                 = 5.0
+PRICE_MAX_HARD            = 150.0
+PRICE_MAX_PREFERRED       = 50.0   # scoring nudge only
+MIN_AVG_VOLUME            = 200_000
+MIN_SHARES_REQUIRED       = 3
+
+USE_SPY_TREND_FILTER      = True
+USE_VIX_FILTER            = True
+VIX_MAX                   = 25
+USE_EARNINGS_FILTER       = True
+EARNINGS_BUFFER_DAYS      = 3
+USE_MACD_CONFIRMATION     = False   # permanently off
+EXTENDED_UNIVERSE_ENABLED = True    # S&P 500 + NASDAQ-100
 ```
-BUY  signal: RSI < 30  AND  (20MA > 50MA  OR  golden cross today)
-SELL signal: RSI > 70  AND  (20MA < 50MA  OR  death cross today)
-NONE:        RSI or MA not confirming — no signal fired
-```
 
-Both RSI and MA must agree before a signal fires (reduces false alerts).
+---
 
-### Layer 3 — Quality Filter
-- Dedup: has this ticker already fired a signal today? → skip if yes
-- (No open/close volatility filter — we're on daily candles, not intraday)
+## Backtest Results (do not change parameters without re-running)
+
+**Universe:** S&P 500 (503 tickers) | **Window:** 2 years (May 2024–May 2026) | **Capital:** $5,000
+
+| Round | What was tested | Result |
+|---|---|---|
+| Round 1 | Position size grid (900 combos) | 12% best PF (3.23) + most profit |
+| Round 2 | SPY MA + VIX filters | No effect in bull window — kept as live safety nets |
+| Round 3 | BB bands, 200MA slope, max hold caps | None beat baseline — baseline locked |
+| Round 4 | ATR-target sizing, price cap $5–$150 | Baseline still best total profit; price cap fixes AZO bug |
+| Round 5 | Extended universe: S&P 500 + NASDAQ-100 | NASDAQ-100 adds only 13 new tickers (rest overlap); P&L ▼$238, win rate ▼2.2% — not adopted |
+
+**Confirmed best (baseline):**
+- Return: +131.6% | Win rate: 74.3% | Profit factor: 3.23 | Max drawdown: -3.4% | 136 trades
+
+**Round 4 key finding:** ATR-target $40/trade sizing reduces per-trade variance (avg win $37, avg loss $27, DD -1.3%) but also reduces 2-year total P&L by ~70%. Price cap alone ($5–$150) is the correct fix — adopted for live. ATR-target sizing not adopted.
+
+**Round 5 key finding:** NASDAQ-100 adds only 13 unique tickers beyond S&P 500 (most NASDAQ-100 stocks are already in S&P 500). Extended universe (515 tickers) vs S&P 500 (502): trades +1, P&L ▼$238, win rate ▼2.2%, PF 2.47 vs 2.83. S&P 500-only universe is better for this strategy. `EXTENDED_UNIVERSE_ENABLED` left as True in config (no harm — nearly identical universe in practice) but the bot effectively scans ~503 tickers.
 
 ---
 
@@ -102,18 +163,40 @@ Both RSI and MA must agree before a signal fires (reduces false alerts).
 
 ```
 stock-signal-bot/
-├── main.py           — Entry point: loads .env, starts scheduler + Telegram bot
-├── scanner.py        — Fetches S&P 500 list + bulk-downloads + scores all 500 stocks
-├── signals.py        — RSI + MA crossover analysis for individual stocks
-├── telegram_bot.py   — Bot commands + channel posting + message formatters
-├── charts.py         — Generates dark-mode price/RSI chart PNG via matplotlib
-├── watchlist.py      — Saves/loads daily top 10 + tracks fired signals (JSON)
-├── config.py         — All thresholds, weights, schedule times, settings
-├── .env              — Telegram token + channel ID (never commit this)
-├── requirements.txt  — All Python dependencies
-├── watchlist.json    — Auto-generated at runtime, ignored by git
-├── CONTEXT.md        — This file (AI session context)
-└── README.md         — Plain-language description (shareable with friends)
+├── main.py                  — Entry point, 5 scheduled jobs
+├── scanner.py               — Morning scan + run_auto_scan() ~600 tickers
+│                              + get_nasdaq100_tickers() + get_extended_tickers()
+├── signals.py               — RSI + MA analysis + calculate_position_size()
+├── telegram_bot.py          — All commands + channel posting + rate limiting
+├── charts.py                — Dark-mode price/RSI chart PNG (with column validation)
+├── watchlist.py             — Daily watchlist (atomic JSON writes)
+├── custom_watchlist.py      — Persistent custom watchlist per user
+├── ibkr.py                  — IB Gateway connection + is_connected() health check
+├── config.py                — All strategy constants — edit here only
+├── trader.py                — Alpaca bracket orders + circuit breakers
+├── trade_logger.py          — CSV trade log + atomic pending queue + pause flag
+├── reporter.py              — Weekly and inception-to-date reports
+├── backtester.py            — Swing backtester (4-round framework complete)
+├── intraday_backtester.py   — Intraday backtester (concluded — swing wins)
+├── .env                     — All API keys (never commit)
+├── requirements.txt         — Python dependencies
+│
+├── trades.csv               — All trade records — DO NOT DELETE
+├── pending_trades.json      — Trades queued for next morning (atomic writes)
+├── trading_paused.flag      — Exists when auto-trading is paused
+├── watchlist.json           — Daily top-50 watchlist (atomic writes)
+├── custom_watchlist.json    — Custom watchlist
+│
+├── backtest_cache.pkl       — Daily price data (2yr+300d) — DO NOT DELETE
+├── backtest_indicators.pkl  — Precomputed swing indicators
+├── backtest_exits.pkl       — Precomputed exit outcomes
+├── backtest_spy.pkl         — SPY MA data
+├── backtest_vix.pkl         — VIX data
+│
+├── CONTEXT.md               — This file
+├── automatedtradingplan.md  — Full strategy + backtest results + roadmap
+├── STOCK_BOT_IMPLEMENTATION_PLAN.md — Round 4 implementation plan (executed)
+└── README.md                — Plain-language project description
 ```
 
 ---
@@ -123,23 +206,38 @@ stock-signal-bot/
 | File | Key functions |
 |---|---|
 | `config.py` | All constants — edit thresholds here, nowhere else |
-| `scanner.py` | `get_sp500_tickers()`, `fetch_data()`, `run_morning_scan()` |
-| `signals.py` | `analyse(ticker, df)`, `run_signal_check(watchlist)`, `fetch_ticker_data(ticker)` |
-| `watchlist.py` | `save_watchlist()`, `get_watchlist()`, `mark_signal_fired()`, `has_signal_fired()` |
-| `telegram_bot.py` | `build_application()`, `post_watchlist()`, `post_signal()`, `post_summary()` |
-| `charts.py` | `generate_chart(ticker, df)` → returns `Path` to temp PNG |
-| `main.py` | `job_morning_scan()`, `job_signal_check()`, `main()` |
+| `scanner.py` | `get_extended_tickers()`, `get_sp500_tickers()`, `get_nasdaq100_tickers()`, `fetch_data()`, `run_morning_scan()`, `run_auto_scan()` |
+| `signals.py` | `analyse()`, `calculate_position_size()`, `fetch_ticker_data()`, `fetch_realtime_price()` |
+| `watchlist.py` | `save_watchlist()`, `get_watchlist()`, `mark_signal_fired()` — atomic writes |
+| `trade_logger.py` | `queue_pending_trade()`, `load_pending_trades()`, `log_order_placed()`, `_atomic_json_write()` |
+| `trader.py` | `place_bracket_order()`, `run_circuit_breakers()`, `check_earnings()`, `check_vix()` |
+| `telegram_bot.py` | All command handlers + `build_application()` + `_is_rate_limited()` |
+| `charts.py` | `generate_chart(ticker, df)` — validates columns before rendering |
+| `main.py` | `job_morning_scan()`, `job_execute_trades()`, `job_signal_check()`, `job_monitor_positions()` |
+| `ibkr.py` | `is_connected()`, `get_price()`, `get_portfolio()` |
 
 ---
 
-## Telegram Bot Commands
+## Telegram Commands
 
 | Command | What it does |
 |---|---|
-| `/watchlist` | Shows today's top 10 stocks |
-| `/signal NVDA` | Shows current RSI + MA status for any ticker |
-| `/chart NVDA` | Sends a price chart image with 20MA, 50MA, RSI |
-| `/status` | Shows if bot is running and next scheduled job times |
+| `/watchlist` | Today's top scored stocks (rate-limited) |
+| `/signal NVDA` | RSI + MA status + real-time price (rate-limited) |
+| `/chart NVDA` | Price chart with 20MA, 50MA, RSI (rate-limited) |
+| `/positions` | Open Alpaca positions with unrealised P&L |
+| `/trades` | Full trade history + win rate + P&L |
+| `/report` | This week's performance report |
+| `/report all` | Full inception-to-date report vs backtest |
+| `/pause` | Pause auto-trading |
+| `/resume` | Resume auto-trading |
+| `/stopall confirm` | Emergency: cancel all orders + liquidate all positions |
+| `/status` | Bot health, schedule, trading stats |
+| `/health` | Check Alpaca / yfinance / IBKR connectivity live |
+| `/mywatchlist` | Manage a custom watchlist |
+| `/scanmywatchlist` | Scan your custom watchlist for signals |
+| `/portfolio` | IBKR positions (when connected) |
+| `/testrun` | Manually trigger a scheduled job (testing) |
 
 ---
 
@@ -162,41 +260,34 @@ stock-signal-bot/
 ## Setup Instructions (first time)
 
 ```bash
-# 1. Install dependencies
 cd ~/Desktop/stock-signal-bot
 /Library/Developer/CommandLineTools/usr/bin/python3.9 -m pip install -r requirements.txt
-
-# 2. .env is already filled in (Telegram token + channel ID + Alpaca keys)
-
-# 3. Run the bot
 /Library/Developer/CommandLineTools/usr/bin/python3.9 main.py
 ```
 
 > IMPORTANT: Always use Python 3.9 explicitly. The system `python3` points to 3.14
 > which breaks python-telegram-bot 20.7.
 
-The bot will log its schedule and wait for the next scheduled job time.
-
 ---
 
 ## Current Status
 
-- [x] All files written and complete
-- [x] Dependencies installed
-- [x] `.env` filled in with Telegram token, channel ID, and Alpaca API keys
-- [x] Bot connects to Telegram successfully
-- [x] Signal logic tested — AAPL returned correct RSI/MA values
-- [x] Wikipedia 403 fix applied (User-Agent header in requests)
-- [x] Python 3.9 type hint fixes applied (`Optional` instead of `X | None`)
-- [x] yfinance MultiIndex column fix applied (newer yfinance returns MultiIndex)
-- [x] Real-time price via Alpaca added to `/signal` command
-- [x] Fallback to yfinance price if Alpaca unavailable
-- [x] Price note in signal message shows whether price is real-time or delayed
-- [x] Project pushed to GitHub (https://github.com/ym78900/stock-signal-bot)
-- [ ] Full end-to-end test completed (watchlist posted to channel)
-- [ ] Signals validated over 1 week of observation
-- [ ] (Future) IBKR TWS API connected
-- [ ] (Future) Auto-execution via IBKR with Telegram approval button
+- [x] Fully automated trading pipeline: scan → queue → bracket order → monitor
+- [x] 5 circuit breakers: VIX, SPY trend, consecutive loss pause, position limits, earnings filter
+- [x] ATR-based stop/target sizing (Stop: Entry−ATR×3.5, Target: Entry+ATR×6.0)
+- [x] Position sizing via `calculate_position_size()` — AZO bug fixed, min 3 shares enforced
+- [x] Price cap $5–$150 in scanner + auto-scan (hard filter)
+- [x] NASDAQ-100 expansion — ~600 tickers in universe
+- [x] 4-round backtesting framework complete — all parameters locked
+- [x] CSV trade logging, pending queue with atomic JSON writes
+- [x] Telegram bot with full command set + 5s rate limiting on /signal /chart /watchlist
+- [x] /health command — live connectivity check for Alpaca, yfinance, IBKR
+- [x] charts.py — column validation before rendering, temp files always cleaned up
+- [x] Pushed to GitHub: https://github.com/ym78900/stock-signal-bot
+- [ ] End-to-end paper trade test (full cycle: signal → order → fill → exit → report)
+- [ ] 1–2 weeks paper trading to validate order fills and Telegram notifications
+- [ ] VPS deployment for 24/7 operation (Hetzner ~€4/mo recommended)
+- [ ] IBKR live trading (after 6+ weeks positive paper results)
 
 ---
 
@@ -204,34 +295,25 @@ The bot will log its schedule and wait for the next scheduled job time.
 
 | Bug | Fix | File |
 |---|---|---|
+| `max(1, int(...))` forces 1 share (AZO at $3k = 60% of portfolio) | `calculate_position_size()` with min 3 shares + `if qty == 0: skip` | `main.py`, `signals.py` |
+| Hard price cap missing | Skip stocks below $5 or above $150 in scanner + auto-scan | `scanner.py`, `config.py` |
+| charts.py silently fails on malformed yfinance response | Column validation before rendering | `charts.py` |
+| Temp chart PNGs accumulate in /tmp | `try/finally` ensures deletion even on send failure | `telegram_bot.py` |
+| JSON race condition (concurrent scheduler + Telegram commands) | Atomic writes via temp file + `os.replace()` | `watchlist.py`, `trade_logger.py` |
+| No Telegram rate limiting — vulnerable to command spam | 5-second per-user cooldown on /signal /chart /watchlist | `telegram_bot.py` |
 | `pandas-ta` not available on Python 3.9 | Switched to `ta` library | `scanner.py`, `signals.py`, `charts.py` |
-| `X \| None` type hints fail on Python 3.9 | Replaced with `Optional[X]` from `typing` | All files |
 | yfinance returns MultiIndex DataFrame | Added `.get_level_values(0)` flatten | `scanner.py`, `signals.py` |
 | Wikipedia returns 403 Forbidden | Added `User-Agent` header via `requests` | `scanner.py` |
-| `python3` on mac points to 3.14 — breaks PTB 20.7 | Use `/Library/Developer/CommandLineTools/usr/bin/python3.9` explicitly | — |
-
----
-
-## What is NOT built yet (future phases)
-
-- No automatic trade execution — user acts manually via IBKR
-- No IBKR connection — data comes from yfinance only
-- No earnings calendar awareness — bot may fire signals on earnings days (noisy)
-- No news sentiment — signals are purely technical
-- No paper trade tracker — P&L tracking not yet implemented
-- No ML/AI predictions — keeping signals simple and explainable
 
 ---
 
 ## Known Gotchas
 
-- **yfinance bulk download:** Use `yfinance.download(tickers=[...], group_by="ticker")` for 500 stocks — never download one by one (rate limit risk)
-- **BRK.B ticker:** Wikipedia lists it as `BRK.B`, yfinance needs `BRK-B` — handled in `scanner.py` with `.replace(".", "-")`
-- **APScheduler + asyncio:** Uses `AsyncIOScheduler`, not `BackgroundScheduler` — required because `python-telegram-bot` v20+ is fully async
-- **Chart temp files:** `charts.py` saves PNGs to the system temp dir — caller is responsible for deleting after sending
-- **watchlist.json date check:** `watchlist.py` always checks if saved date matches today — returns empty list if stale (previous day's data)
-- **Test mode:** `config.py` schedule times may be set to test values — reset to production times before real use:
-  - `MORNING_SCAN_HOUR = 16, MORNING_SCAN_MINUTE = 0`
-  - `WATCHLIST_POST_HOUR = 16, WATCHLIST_POST_MINUTE = 20`
-  - `SIGNAL_CHECK_HOUR = 23, SIGNAL_CHECK_MINUTE = 15`
-  - `main.py` sleep: `await asyncio.sleep(20 * 60)` (not 1 min)
+- **Python version:** Always `/Library/Developer/CommandLineTools/usr/bin/python3.9` — system `python3` = 3.14 which breaks PTB 20.7
+- **yfinance bulk download:** Use `yfinance.download(tickers=[...], group_by="ticker")` — never one by one
+- **BRK.B ticker:** Wikipedia uses dot notation, yfinance needs dash — `.replace(".", "-")` in `scanner.py`
+- **APScheduler + asyncio:** Uses `AsyncIOScheduler` — required because PTB v20+ is fully async
+- **IBKR thread isolation:** `ib_insync` runs in a separate thread with its own event loop — do not share with asyncio loop
+- **Telegram callback_data:** 64-byte limit — never encode long strings in it
+- **Look-ahead bias in backtester:** Exit cache scans full future hold period — acknowledged trade-off for speed. Live performance may be 5–15% below backtest numbers.
+- **Cache files (.pkl):** Delete to force re-download. `backtest_cache.pkl` and `backtest_indicators.pkl` are the slow ones (2yr data for 500+ tickers). Do not delete unless necessary.

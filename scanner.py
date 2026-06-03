@@ -67,7 +67,7 @@ def get_nasdaq100_tickers() -> List[str]:
         response.raise_for_status()
         tables = pd.read_html(io.StringIO(response.text))
         for table in tables:
-            cols = [c.lower() for c in table.columns]
+            cols = [c.lower() if isinstance(c, str) else "" for c in table.columns]
             if "ticker" in cols or "symbol" in cols:
                 col = "Ticker" if "Ticker" in table.columns else "Symbol"
                 tickers = table[col].dropna().tolist()

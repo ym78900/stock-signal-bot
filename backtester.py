@@ -38,7 +38,7 @@ import ta as ta_lib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from scanner import get_sp500_tickers
+from scanner import get_sp500_tickers, get_extended_tickers
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,23 +70,42 @@ EXITS_CACHE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bac
 SPY_CACHE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_spy.pkl")
 VIX_CACHE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_vix.pkl")
 
+# Extended universe (S&P 500 + NASDAQ-100) — separate caches to avoid invalidating Round 1-4 results
+EXTENDED_CACHE_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache_extended.pkl")
+EXTENDED_INDICATORS_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_indicators_extended.pkl")
+EXTENDED_EXITS_CACHE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_exits_extended.pkl")
+
 
 # ── Step 1: Download & cache raw price data ────────────────────────────────────
 
-def load_or_download_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
-    if os.path.exists(CACHE_FILE):
-        logger.info("Loading data from cache (delete backtest_cache.pkl to re-download)...")
-        with open(CACHE_FILE, "rb") as f:
-            return pickle.load(f)
+def load_or_download_data(tickers: List[str], cache_file: str = None) -> Dict[str, pd.DataFrame]:
+    """
+    Load price data from cache, downloading only missing tickers if cache exists.
+    Pass cache_file to use an alternate cache (e.g. for extended universe).
+    """
+    if cache_file is None:
+        cache_file = CACHE_FILE
+
+    existing: Dict[str, pd.DataFrame] = {}
+    if os.path.exists(cache_file):
+        logger.info(f"Loading data from cache ({os.path.basename(cache_file)})...")
+        with open(cache_file, "rb") as f:
+            existing = pickle.load(f)
+
+    missing = [t for t in tickers if t not in existing]
+
+    if not missing:
+        logger.info(f"Cache hit — {len(existing)} tickers, no new downloads needed.")
+        return existing
 
     end_date   = datetime.today()
-    # Extra 300 days for 200MA warmup on top of the 2-year backtest window
     start_date = end_date - timedelta(days=BACKTEST_YEARS * 365 + 300)
 
-    logger.info(f"Downloading {len(tickers)} tickers ({start_date.date()} → {end_date.date()})...")
+    logger.info(f"Downloading {len(missing)} new tickers "
+                f"({start_date.date()} → {end_date.date()})...")
 
     raw = yf.download(
-        tickers=tickers,
+        tickers=missing,
         start=start_date.strftime("%Y-%m-%d"),
         end=end_date.strftime("%Y-%m-%d"),
         interval="1d",
@@ -97,22 +116,24 @@ def load_or_download_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
     )
 
     min_rows = MA_200 + ATR_PERIOD + 10
-    data = {}
-    for ticker in tickers:
+    newly_added = 0
+    for ticker in missing:
         try:
-            df = raw[ticker].copy() if len(tickers) > 1 else raw.copy()
+            df = raw[ticker].copy() if len(missing) > 1 else raw.copy()
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df.dropna(subset=["Close"], inplace=True)
             if len(df) >= min_rows:
-                data[ticker] = df
+                existing[ticker] = df
+                newly_added += 1
         except Exception:
             continue
 
-    logger.info(f"Downloaded data for {len(data)} tickers. Saving cache...")
-    with open(CACHE_FILE, "wb") as f:
-        pickle.dump(data, f)
-    return data
+    logger.info(f"Added {newly_added} new tickers. Total cache size: {len(existing)}. Saving...")
+    with open(cache_file, "wb") as f:
+        pickle.dump(existing, f)
+
+    return existing
 
 
 # ── Step 1b: SPY trend data ────────────────────────────────────────────────────
@@ -212,13 +233,15 @@ def load_vix() -> Dict[pd.Timestamp, float]:
 
 # ── Step 2: Precompute all indicators ONCE ─────────────────────────────────────
 
-def precompute_signals(data: Dict[str, pd.DataFrame]) -> Tuple[List[dict], Dict[str, pd.DataFrame]]:
+def precompute_signals(data: Dict[str, pd.DataFrame], indicators_cache: str = None) -> Tuple[List[dict], Dict[str, pd.DataFrame]]:
     """
     Precompute RSI, MA, ATR, volume ratio, MACD, 200MA, prev_rsi, ATR% per row.
     Cached with version check — regenerates automatically when INDICATORS_VERSION bumps.
+    Pass indicators_cache to use an alternate cache file (e.g. extended universe).
     """
-    if os.path.exists(INDICATORS_CACHE):
-        with open(INDICATORS_CACHE, "rb") as f:
+    cache_path = indicators_cache if indicators_cache is not None else INDICATORS_CACHE
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
             cached = pickle.load(f)
         version = cached[0] if isinstance(cached[0], int) else 1
         if version == INDICATORS_VERSION:
@@ -324,7 +347,7 @@ def precompute_signals(data: Dict[str, pd.DataFrame]) -> Tuple[List[dict], Dict[
 
     rows.sort(key=lambda x: x["date"])
     logger.info(f"Precomputed {len(rows)} signal candidates. Saving indicator cache...")
-    with open(INDICATORS_CACHE, "wb") as f:
+    with open(cache_path, "wb") as f:
         pickle.dump((INDICATORS_VERSION, rows, processed), f)
     return rows, processed
 
@@ -337,10 +360,12 @@ def precompute_exits(
     atr_stop_values: List[float],
     atr_target_values: List[float],
     max_hold_days: int = 60,
+    exits_cache: str = None,
 ) -> List[dict]:
-    if os.path.exists(EXITS_CACHE):
+    cache_path = exits_cache if exits_cache is not None else EXITS_CACHE
+    if os.path.exists(cache_path):
         logger.info("Loading precomputed exits from cache...")
-        with open(EXITS_CACHE, "rb") as f:
+        with open(cache_path, "rb") as f:
             return pickle.load(f)
 
     logger.info(f"Precomputing exit outcomes for {len(rows)} candidates × "
@@ -409,7 +434,7 @@ def precompute_exits(
         enriched.append(enriched_row)
 
     logger.info(f"Exit outcomes precomputed for {len(enriched)} rows. Saving cache...")
-    with open(EXITS_CACHE, "wb") as f:
+    with open(cache_path, "wb") as f:
         pickle.dump(enriched, f)
     return enriched
 
@@ -1743,3 +1768,91 @@ NOTE — Earnings filter (Phase 3d):
 
     print("\nRound 4 complete.")
     print("Adopt whichever scenario hits ≥$40/day with ≥65% win rate and ≤35% max drawdown.")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ROUND 5 — Extended Universe: S&P 500 + NASDAQ-100 (~600 tickers)
+    # Does adding NASDAQ-100 stocks increase trade frequency and total P&L?
+    # Uses separate cache files — does NOT invalidate Rounds 1-4 results.
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("\n\n" + "=" * 68)
+    print("  ROUND 5: Extended Universe — S&P 500 + NASDAQ-100 (~600 tickers)")
+    print("=" * 68)
+    print("  Downloading any NASDAQ-100 tickers not already in S&P 500 cache...")
+    print("  (Incremental — only new tickers are downloaded)\n")
+
+    ext_tickers = get_extended_tickers()
+    sp_tickers  = get_sp500_tickers()
+    new_tickers = [t for t in ext_tickers if t not in set(sp_tickers)]
+    print(f"  S&P 500: {len(sp_tickers)} tickers  |  NASDAQ-100 additions: {len(new_tickers)}  |  Total: {len(ext_tickers)}")
+
+    ext_data = load_or_download_data(ext_tickers, cache_file=EXTENDED_CACHE_FILE)
+    if not ext_data:
+        print("ERROR: Could not load extended universe data.")
+    else:
+        print(f"\n  Precomputing indicators for {len(ext_data)} tickers...")
+        ext_rows, ext_processed = precompute_signals(ext_data, indicators_cache=EXTENDED_INDICATORS_CACHE)
+        if not ext_rows:
+            print("ERROR: Could not compute indicators for extended universe.")
+        else:
+            atr_stops   = [1.5, 2.0, 2.5, 3.0, 3.5]
+            atr_targets = [2.5, 3.0, 3.5, 4.0, 5.0, 6.0]
+            ext_enriched = precompute_exits(ext_rows, ext_processed, atr_stops, atr_targets,
+                                            exits_cache=EXTENDED_EXITS_CACHE)
+            print(f"  Extended universe rows: {len(ext_enriched)}\n")
+
+            R5_RSI_BUY    = 38
+            R5_RSI_SELL   = 55
+            R5_ATR_STOP   = 3.5
+            R5_ATR_TARGET = 6.0
+            r5_filters = dict(
+                volume_min_ratio=1.2,
+                spy_trend=spy_trend,
+                vix_data=vix_data,
+                vix_max=25,
+                spy_ma="above_50ma",
+                min_price=5.0,
+                max_price=150.0,
+            )
+
+            # 5A: S&P 500 only (baseline from Round 4)
+            _, s_5a = simulate_fast(
+                enriched_2y, R5_RSI_BUY, R5_RSI_SELL, R5_ATR_STOP, R5_ATR_TARGET,
+                max_position_pct=0.12, max_open_pos=5,
+                sizing_mode="fixed_pct",
+                **r5_filters,
+            )
+            print_report(s_5a, "5A: S&P 500 only (503 tickers, 12% fixed sizing)")
+
+            # 5B: S&P 500 + NASDAQ-100 (extended universe)
+            _, s_5b = simulate_fast(
+                ext_enriched, R5_RSI_BUY, R5_RSI_SELL, R5_ATR_STOP, R5_ATR_TARGET,
+                max_position_pct=0.12, max_open_pos=5,
+                sizing_mode="fixed_pct",
+                **r5_filters,
+            )
+            print_report(s_5b, f"5B: S&P 500 + NASDAQ-100 (~{len(ext_data)} tickers, 12% fixed)")
+
+            round5_results = [
+                {"label": f"5A: S&P 500 only ({len(data)} tickers)", "summary": s_5a},
+                {"label": f"5B: Extended universe (~{len(ext_data)} tickers)", "summary": s_5b},
+            ]
+            print_comparison(round5_results, title="ROUND 5 SUMMARY — S&P 500 vs Extended Universe")
+
+            if s_5a and s_5b:
+                delta_trades = (s_5b["total_trades"] - s_5a["total_trades"])
+                delta_pnl    = (s_5b["total_net_pnl"] - s_5a["total_net_pnl"])
+                delta_wr     = (s_5b["win_rate_pct"]  - s_5a["win_rate_pct"])
+                print(f"\n  NASDAQ-100 expansion impact:")
+                print(f"    Trade count: {'+' if delta_trades >= 0 else ''}{delta_trades} trades")
+                print(f"    Total P&L:   {'▲ +' if delta_pnl >= 0 else '▼ '}${abs(delta_pnl):,.2f}")
+                print(f"    Win rate:    {'+' if delta_wr >= 0 else ''}{delta_wr:.1f}%")
+                verdict = (
+                    "✅ ADOPT — extended universe meaningfully improves both P&L and win rate."
+                    if delta_pnl > 50 and delta_wr >= 0
+                    else "⚠️  NEUTRAL — marginal or mixed improvement, not worth the added complexity."
+                    if delta_pnl > 0
+                    else "❌ SKIP — extended universe reduces P&L and/or win rate vs S&P 500 only."
+                )
+                print(f"\n  VERDICT: {verdict}")
+
+    print("\nRound 5 complete.")
