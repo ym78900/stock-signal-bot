@@ -40,8 +40,10 @@ DATA_INTERVAL = "1d"       # Daily candles
 #                              none beat baseline; baseline kept
 # Round 4 (price cap + sizing): $5–$150 hard cap adopted; ATR-target $40 sizing rejected
 # Round 5 (universe size):    S&P 500-only confirmed best; NASDAQ-100 and full market rejected
+# Round 6 (price cap raise):  $250 cap confirmed best: 100 trades, 74.0% win, PF 3.22, +$4,302
+#                              vs $150 baseline: 78 trades, 71.8% win, PF 2.83, +$2,713
 #
-# Final performance: +131.6% over 2 years, 74.3% win rate, -3.4% max DD, PF 3.23
+# Final performance (Round 6): +86.0% over 2 years, 74.0% win rate, -4.0% max DD, PF 3.22
 RSI_BUY_THRESHOLD  = 38    # RSI below this → BUY signal
 RSI_SELL_THRESHOLD = 55    # RSI above this → informational only (exits handled by ATR bracket)
 RSI_PERIOD         = 14    # Standard RSI period
@@ -103,9 +105,10 @@ VOLUME_AVG_DAYS = 20
 
 # ── Price Filters ─────────────────────────────────────────────────────────────
 PRICE_MIN           = 5.0    # Hard skip: stocks below $5 (too illiquid)
-PRICE_MAX_HARD      = 150.0  # Hard skip: stocks above $150 — with $5k budget,
-                             # even 1 share at $3,000 wipes 60% of capital.
-                             # $150 = max where 12% position ($600) ≥ 4 shares.
+PRICE_MAX_HARD      = 250.0  # Hard skip: stocks above $250 — confirmed best in Round 6
+                             # price cap backtest ($150 vs $200 vs $250 vs no cap).
+                             # $250 = 100 trades, 74.0% win, PF 3.22 — best profit factor.
+                             # Natural floor: 12% of $5k = $600 ÷ 3 shares min = $200 natural cap.
 PRICE_MAX_PREFERRED = 50.0   # Soft scoring bonus for stocks in the $5–$50 range
 MIN_AVG_VOLUME      = 200_000  # Hard skip: under 200K avg daily volume = illiquid
 

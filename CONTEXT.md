@@ -33,7 +33,7 @@ A fully automated Python swing trading bot that:
 | RSI timeframe | Daily candles only (`interval="1d"`) | Reliable, matches swing hold periods |
 | Signal timing | Post-close only (11:15 PM Finnish) | New daily candles finalize at market close |
 | Universe | S&P 500 only (~503 tickers) | Round 5 backtest: NASDAQ-100 adds 13 tickers and reduces P&L; full NYSE+NASDAQ produces 18 trades vs 78 — filters reject most small-caps |
-| Price filter | Hard skip below $5 or above $150 | Prevents 1-share position blowups (AZO bug) |
+| Price filter | Hard skip below $5 or above $250 | Round 6 backtest: $250 cap = 100 trades, 74.0% win, PF 3.22 — best of all tested caps |
 | Position sizing | ATR-based `calculate_position_size()` targeting $40/trade, 15% hard cap | Replaces broken `max(1, int(...))` formula |
 | Min shares | 3 shares minimum | Skip trade if can't buy ≥3 within position cap |
 | Data library | yfinance (unofficial Yahoo Finance) | Free, reliable for daily candles |
@@ -88,7 +88,7 @@ RSI score       (40%) = |RSI - 50| / 20, capped at 1.0
 Momentum score  (25%) = |5-day % price change| / 10%, capped at 1.0
 + 0.10 bonus if price in $5–$50 range (preferred cheap stocks)
 ```
-Stocks below $5 or above $150 are hard-filtered out before scoring.
+Stocks below $5 or above $250 are hard-filtered out before scoring.
 Stocks with average volume < 200K/day are hard-filtered out.
 
 ### Auto-scan signal engine (11:15 PM)
@@ -96,7 +96,7 @@ Stocks with average volume < 200K/day are hard-filtered out.
 BUY signal fires when ALL of:
   RSI(14) < 38                    — oversold on daily candles
   Volume > 1.2× 20-day avg        — confirmed interest
-  Price in $5–$150                — within tradeable range
+  Price in $5–$250                — within tradeable range
   SPY above 50MA                  — bull market condition
   VIX < 25                        — not a fear/volatility spike
   No earnings within 3 days       — avoid event risk
@@ -105,7 +105,7 @@ BUY signal fires when ALL of:
 
 ---
 
-## Strategy Parameters (locked — confirmed by 4-round backtesting)
+## Strategy Parameters (locked — confirmed by 6-round backtesting)
 
 ```python
 RSI_BUY_THRESHOLD         = 38
@@ -122,7 +122,7 @@ CONSECUTIVE_LOSS_LIMIT    = 3
 DAILY_PROFIT_TARGET       = 40.0   # target $ per winning trade for sizing
 
 PRICE_MIN                 = 5.0
-PRICE_MAX_HARD            = 150.0
+PRICE_MAX_HARD            = 250.0
 PRICE_MAX_PREFERRED       = 50.0   # scoring nudge only
 MIN_AVG_VOLUME            = 200_000
 MIN_SHARES_REQUIRED       = 3
@@ -149,9 +149,10 @@ EXTENDED_UNIVERSE_ENABLED = True    # S&P 500 + NASDAQ-100
 | Round 3 | BB bands, 200MA slope, max hold caps | None beat baseline — baseline locked |
 | Round 4 | ATR-target sizing, price cap $5–$150 | Baseline still best total profit; price cap fixes AZO bug |
 | Round 5 | Universe size: S&P 500 vs +NASDAQ-100 vs full NYSE+NASDAQ (5,177 tickers) | S&P 500 wins decisively. Full market: only 18 trades, P&L ▼$2,144 vs baseline. NASDAQ-100 adds nothing. S&P 500-only confirmed. |
+| Round 6 | Price cap variants: $150 vs $200 vs $250 vs no cap | $250 cap wins: 100 trades, 74.0% win, PF 3.22, +$4,302. Best profit factor. No cap adds 6 more trades but PF drops to 3.09. |
 
-**Confirmed best (baseline):**
-- Return: +131.6% | Win rate: 74.3% | Profit factor: 3.23 | Max drawdown: -3.4% | 136 trades
+**Confirmed best (Round 6 baseline):**
+- Return: +86.0% over 2 years | Win rate: 74.0% | Profit factor: 3.22 | Max drawdown: -4.0% | 100 trades
 
 **Round 4 key finding:** ATR-target $40/trade sizing reduces per-trade variance (avg win $37, avg loss $27, DD -1.3%) but also reduces 2-year total P&L by ~70%. Price cap alone ($5–$150) is the correct fix — adopted for live. ATR-target sizing not adopted.
 
@@ -284,7 +285,7 @@ cd ~/Desktop/stock-signal-bot
 - [x] 5 circuit breakers: VIX, SPY trend, consecutive loss pause, position limits, earnings filter
 - [x] ATR-based stop/target sizing (Stop: Entry−ATR×3.5, Target: Entry+ATR×6.0)
 - [x] Position sizing via `calculate_position_size()` — AZO bug fixed, min 3 shares enforced
-- [x] Price cap $5–$150 in scanner + auto-scan (hard filter)
+- [x] Price cap $5–$250 in scanner + auto-scan (hard filter, raised from $150 in Round 6)
 - [x] NASDAQ-100 expansion — ~600 tickers in universe
 - [x] 4-round backtesting framework complete — all parameters locked
 - [x] CSV trade logging, pending queue with atomic JSON writes
