@@ -30,15 +30,16 @@ DATA_PERIOD   = "60d"      # 60 days of history (enough for 50-day MA + ATR)
 DATA_INTERVAL = "1d"       # Daily candles
 
 # ── Signal thresholds ─────────────────────────────────────────────────────────
-# Final confirmed values from 3-round backtesting framework (May 2026).
+# Final confirmed values from 5-round backtesting framework (June 2026).
 # Tested on 503 S&P 500 stocks, 2-year window (May 2024–May 2026), $5,000 capital.
 #
 # Round 1 (portfolio params): 900 combos → 12% pos size best PF (3.23)
 # Round 2 (bear protection):  SPY 50/100/200MA + VIX filters → no effect in bull window
 #                              Kept as live-only safety nets
 # Round 3 (new indicators):   BB lower band, 200MA slope, max hold days →
-#                              none beat baseline; 200MA slope raises PF (3.50) but costs $1,488
-#                              → baseline kept (more total profit)
+#                              none beat baseline; baseline kept
+# Round 4 (price cap + sizing): $5–$150 hard cap adopted; ATR-target $40 sizing rejected
+# Round 5 (universe size):    S&P 500-only confirmed best; NASDAQ-100 and full market rejected
 #
 # Final performance: +131.6% over 2 years, 74.3% win rate, -3.4% max DD, PF 3.23
 RSI_BUY_THRESHOLD  = 38    # RSI below this → BUY signal
@@ -115,5 +116,8 @@ MIN_SHARES_REQUIRED       = 3     # Skip trade if can't buy at least 3 shares
                                   # within position cap (prevents 1-share AZO traps)
 
 # ── Extended Universe ─────────────────────────────────────────────────────────
-EXTENDED_UNIVERSE_ENABLED = True
+# Round 5 backtest confirmed S&P 500-only is best:
+#   NASDAQ-100 adds only 13 new tickers and reduces P&L by $238, win rate -2.2%
+#   Full NYSE+NASDAQ (5,177 tickers) produces only 18 trades vs 78 — filters reject small-caps
+EXTENDED_UNIVERSE_ENABLED = False
 NASDAQ100_WIKIPEDIA_URL   = "https://en.wikipedia.org/wiki/Nasdaq-100"
