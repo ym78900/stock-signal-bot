@@ -122,7 +122,9 @@ MIN_AVG_VOLUME      = 200_000  # Hard skip: under 200K avg daily volume = illiqu
 DAILY_PROFIT_TARGET       = 40.0  # Target $ profit per winning trade
 MAX_POSITION_PCT_HARD_CAP = 0.15  # Never exceed 15% of portfolio in one position
 MIN_SHARES_REQUIRED       = 3     # Skip trade if can't buy at least 3 shares
-                                  # within position cap (prevents 1-share AZO traps)
+                                   # within position cap (prevents 1-share AZO traps)
+MAX_HOLD_DAYS             = 60    # Force-close position after 60 calendar days
+                                   # (backtest used 60-day max hold with trailing stop)
 
 # ── Extended Universe ─────────────────────────────────────────────────────────
 # Round 5 backtest confirmed S&P 500-only is best:

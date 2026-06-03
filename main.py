@@ -188,34 +188,33 @@ async def job_execute_trades(bot):
             fill_errors.append(f"{ticker} (fill timeout — cancelled)")
             continue
 
-        # Calculate stop and target from the REAL fill price
-        stop_price   = round(fill_price - atr * config.ATR_STOP_MULTIPLIER,   2)
-        target_price = round(fill_price + atr * config.ATR_TARGET_MULTIPLIER, 2)
+        # Calculate trailing distance from real fill price
+        trail_price  = round(atr * config.ATR_STOP_MULTIPLIER, 2)
 
-        # Place OCO exit
-        oco_id = trader.place_oco_exit(ticker, entry["qty"], stop_price, target_price)
-        if oco_id:
+        # Place trailing stop exit — Alpaca manages the trail server-side
+        exit_order_id = trader.place_trailing_stop_exit(ticker, entry["qty"], trail_price)
+        if exit_order_id:
             tlog.update_trade_after_fill(
                 entry_order_id = entry["order_id"],
                 fill_price     = fill_price,
-                stop_price     = stop_price,
-                target_price   = target_price,
-                oco_order_id   = oco_id,
+                stop_price     = round(fill_price - trail_price, 2),   # initial stop level
+                target_price   = None,                                  # no fixed target
+                oco_order_id   = exit_order_id,
             )
             placed.append({
                 "ticker": ticker,
                 "qty":    entry["qty"],
                 "fill":   fill_price,
-                "stop":   stop_price,
-                "target": target_price,
+                "stop":   round(fill_price - trail_price, 2),
+                "target": "trailing",
             })
         else:
-            # Fill happened but OCO failed — position is open with NO protection!
-            msg = (f"🚨 {ticker}: filled @ ${fill_price} but OCO order FAILED — "
-                   f"position has no stop/target! Cancel manually in Alpaca.")
+            # Fill happened but trailing stop order failed — position is open with NO protection!
+            msg = (f"🚨 {ticker}: filled @ ${fill_price} but trailing stop order FAILED — "
+                   f"position has no stop! Cancel manually in Alpaca.")
             logger.error(msg)
             await tbot.post_alert(bot, msg)
-            fill_errors.append(f"{ticker} (OCO failed — MANUAL ACTION NEEDED)")
+            fill_errors.append(f"{ticker} (trailing stop failed — MANUAL ACTION NEEDED)")
 
     await tbot.post_execution_summary(bot, placed, skipped + fill_errors)
     logger.info(
@@ -278,18 +277,49 @@ async def job_weekly_report(bot):
 async def job_monitor_positions(bot):
     """
     Job 4 — every 15 min during market hours (4:30 PM – 11:00 PM Finnish).
-    Checks for closed OCO legs (stop/target hit) and sends Telegram notification.
-
-    Entry price and stop/target are already set accurately in job_execute_trades
-    Phase 2 (fill-based). The monitor only needs to watch for exit events.
+    1. Checks if any trailing stop orders have been filled (exit detected).
+    2. Enforces MAX_HOLD_DAYS: cancels trailing stop + market-sells any position
+       held longer than the max hold period (backtest used 60 days).
     """
+    from datetime import date, timedelta
     open_trades = tlog.get_open_trades()
     if not open_trades:
         return
 
     tracked_ids = [t["alpaca_order_id"] for t in open_trades if t.get("alpaca_order_id")]
 
-    # ── Check for closed positions (stop or target hit) ───────────────────────
+    # ── Max hold day enforcement ──────────────────────────────────────────────
+    today = date.today()
+    for trade in open_trades:
+        try:
+            entry_date = date.fromisoformat(str(trade.get("entry_date", ""))[:10])
+        except Exception:
+            continue
+        days_held = (today - entry_date).days
+        if days_held >= config.MAX_HOLD_DAYS:
+            ticker   = trade["ticker"]
+            order_id = trade.get("alpaca_order_id", "")
+            logger.info(f"{ticker}: max hold {days_held}d reached — closing position")
+            # Cancel the trailing stop order so it doesn't conflict with market sell
+            if order_id:
+                trader.cancel_order(order_id)
+            # Market sell to close the position
+            try:
+                from alpaca.trading.requests import MarketOrderRequest
+                from alpaca.trading.enums import OrderSide, TimeInForce
+                req = MarketOrderRequest(
+                    symbol        = ticker,
+                    qty           = int(trade["qty"]),
+                    side          = OrderSide.SELL,
+                    time_in_force = TimeInForce.DAY,
+                )
+                trader._trading_client().submit_order(req)
+                msg = f"⏱ {ticker}: max hold ({days_held} days) reached — position closed at market."
+                await tbot.post_alert(bot, msg)
+            except Exception as e:
+                logger.error(f"Max hold market sell failed for {ticker}: {e}")
+
+    # ── Check for trailing stop fills ─────────────────────────────────────────
     closed = trader.get_closed_bracket_legs(tracked_ids)
 
     for c in closed:

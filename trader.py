@@ -263,46 +263,45 @@ def cancel_order(order_id: str) -> bool:
         return False
 
 
-def place_oco_exit(
+def place_trailing_stop_exit(
     ticker: str,
     qty: int,
-    stop_price: float,
-    target_price: float,
+    trail_price: float,
 ) -> Optional[str]:
     """
-    Step 2 of 2: Place an OCO (One-Cancels-Other) sell order after the entry fill.
+    Step 2 of 2: Place a native Alpaca trailing stop sell order after entry fill.
 
-    Creates two linked sell orders:
-      - Limit sell at target_price  (take profit)
-      - Stop  sell at stop_price    (stop loss)
-    When either fills, Alpaca automatically cancels the other.
+    Alpaca manages the trail on their servers in real-time:
+      - Stop price starts at: fill_price − trail_price
+      - As price rises, stop rises with it (always trail_price below peak)
+      - When price drops to the stop level, Alpaca fills the exit automatically
 
-    stop_price and target_price must be calculated from the REAL fill price,
-    not the prior close estimate.
+    trail_price = ATR × ATR_STOP_MULTIPLIER (absolute dollar trail distance).
 
-    Returns the OCO order ID (used to track exits), or None on failure.
+    No fixed take-profit cap — the trailing stop is the only exit.
+    Max hold is enforced separately by the monitor (config.MAX_HOLD_DAYS).
+
+    Returns the Alpaca order ID (used to track exit), or None on failure.
     """
     try:
-        from alpaca.trading.requests import LimitOrderRequest, StopLossRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+        from alpaca.trading.requests import TrailingStopOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
 
-        req = LimitOrderRequest(
+        req = TrailingStopOrderRequest(
             symbol        = ticker,
             qty           = qty,
             side          = OrderSide.SELL,
             time_in_force = TimeInForce.GTC,
-            order_class   = OrderClass.OCO,
-            limit_price   = round(target_price, 2),
-            stop_loss     = StopLossRequest(stop_price=round(stop_price, 2)),
+            trail_price   = round(trail_price, 2),
         )
         order = _trading_client().submit_order(req)
         logger.info(
-            f"OCO exit placed: {ticker} qty={qty} "
-            f"SL=${stop_price:.2f} TP=${target_price:.2f}  id={order.id}"
+            f"Trailing stop placed: {ticker} qty={qty} "
+            f"trail=${trail_price:.2f}  id={order.id}"
         )
         return str(order.id)
     except Exception as e:
-        logger.error(f"Failed to place OCO exit for {ticker}: {e}")
+        logger.error(f"Failed to place trailing stop for {ticker}: {e}")
         return None
 
 
@@ -357,8 +356,12 @@ def get_recently_closed_orders(tracked_order_ids: List[str]) -> List[dict]:
 
 def get_closed_bracket_legs(tracked_order_ids: List[str]) -> List[dict]:
     """
-    More reliable approach: query each tracked order directly and check
-    if any of its child legs (stop/take_profit) have been filled.
+    Check if any tracked exit orders have been filled.
+
+    Handles two cases:
+      - Trailing stop orders (standalone): check if the order itself is filled
+      - OCO/bracket orders (legacy): check if any child leg is filled
+
     Returns list of {alpaca_order_id, ticker, exit_price, exit_reason, exit_date}.
     """
     if not tracked_order_ids:
@@ -370,10 +373,26 @@ def get_closed_bracket_legs(tracked_order_ids: List[str]) -> List[dict]:
         for order_id in tracked_order_ids:
             try:
                 order = client.get_order_by_id(order_id)
-                legs  = getattr(order, "legs", None) or []
+                status = str(order.status).lower()
+                order_type = str(getattr(order, "order_type", "") or "").lower()
+
+                # ── Standalone trailing stop (our new approach) ───────────────
+                if "trailing" in order_type:
+                    if status == "filled" and order.filled_avg_price:
+                        closed.append({
+                            "alpaca_order_id": order_id,
+                            "ticker":          order.symbol,
+                            "exit_price":      round(float(order.filled_avg_price), 4),
+                            "exit_reason":     "trailing_stop",
+                            "exit_date":       str(date.today()),
+                        })
+                    continue
+
+                # ── OCO/bracket legs (legacy fallback) ────────────────────────
+                legs = getattr(order, "legs", None) or []
                 for leg in legs:
                     leg_status = str(leg.status).lower()
-                    if leg_status in ("filled",) and leg.filled_avg_price:
+                    if leg_status == "filled" and leg.filled_avg_price:
                         exit_price  = round(float(leg.filled_avg_price), 4)
                         exit_reason = _map_exit_reason(leg)
                         closed.append({
@@ -384,10 +403,11 @@ def get_closed_bracket_legs(tracked_order_ids: List[str]) -> List[dict]:
                             "exit_date":       str(date.today()),
                         })
                         break  # only one leg fills
+
             except Exception:
                 continue
     except Exception as e:
-        logger.error(f"Error checking bracket legs: {e}")
+        logger.error(f"Error checking exit orders: {e}")
 
     return closed
 
