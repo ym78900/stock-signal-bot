@@ -47,6 +47,65 @@ def get_company_name(ticker: str) -> str:
     return _sp500_names.get(ticker, ticker)
 
 
+_nasdaq100_cache: Optional[List[str]] = None
+
+
+def get_nasdaq100_tickers() -> List[str]:
+    """
+    Fetch the current NASDAQ-100 ticker list from Wikipedia.
+    Cached in memory for the session.
+    """
+    global _nasdaq100_cache
+    if _nasdaq100_cache is not None:
+        return _nasdaq100_cache
+
+    logger.info("Fetching NASDAQ-100 ticker list from Wikipedia...")
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; stock-signal-bot/1.0)"}
+        import requests, io
+        response = requests.get(config.NASDAQ100_WIKIPEDIA_URL, headers=headers, timeout=15)
+        response.raise_for_status()
+        tables = pd.read_html(io.StringIO(response.text))
+        for table in tables:
+            cols = [c.lower() for c in table.columns]
+            if "ticker" in cols or "symbol" in cols:
+                col = "Ticker" if "Ticker" in table.columns else "Symbol"
+                tickers = table[col].dropna().tolist()
+                tickers = [t.replace(".", "-") for t in tickers if isinstance(t, str)]
+                _nasdaq100_cache = tickers
+                logger.info(f"Loaded {len(tickers)} NASDAQ-100 tickers.")
+                return tickers
+        logger.warning("Could not find ticker column in NASDAQ-100 table.")
+        return []
+    except Exception as e:
+        logger.error(f"Failed to fetch NASDAQ-100 list: {e}")
+        return []
+
+
+def get_extended_tickers() -> List[str]:
+    """
+    Return a deduplicated combined ticker list: S&P 500 + NASDAQ-100.
+    Falls back to S&P 500 only if EXTENDED_UNIVERSE_ENABLED is False.
+    """
+    sp500 = get_sp500_tickers()
+
+    if not config.EXTENDED_UNIVERSE_ENABLED:
+        return sp500
+
+    nasdaq = get_nasdaq100_tickers()
+
+    seen     = set(sp500)
+    combined = list(sp500)
+    for t in nasdaq:
+        if t not in seen:
+            combined.append(t)
+            seen.add(t)
+
+    logger.info(f"Extended universe: {len(combined)} tickers "
+                f"(S&P500={len(sp500)}, NASDAQ-100 additions={len(combined)-len(sp500)})")
+    return combined
+
+
 def get_sp500_tickers() -> List[str]:
     """
     Fetch the current S&P 500 ticker list from Wikipedia.
@@ -145,6 +204,11 @@ def _score_stock(ticker: str, df: pd.DataFrame) -> Optional[dict]:
     Returns a dict with the score and raw values, or None if data is invalid.
     """
     try:
+        # ── Liquidity guard ───────────────────────────────────────────────────
+        avg_vol = df["Volume"].mean()
+        if avg_vol < config.MIN_AVG_VOLUME:
+            return None  # too illiquid — skip entirely
+
         # RSI
         rsi_series = ta_lib.momentum.RSIIndicator(df["Close"], window=config.RSI_PERIOD).rsi()
         if rsi_series is None or rsi_series.dropna().empty:
@@ -162,6 +226,12 @@ def _score_stock(ticker: str, df: pd.DataFrame) -> Optional[dict]:
         if len(df) < config.MOMENTUM_DAYS + 1:
             return None
         price_now  = float(df["Close"].iloc[-1])
+
+        # ── Hard price cap — MUST come before any other calculation ───────────
+        # Prevents the max(1, 0) = 1 share bug for stocks like AZO at $3,000.
+        if price_now < config.PRICE_MIN or price_now > config.PRICE_MAX_HARD:
+            return None
+
         price_then = float(df["Close"].iloc[-config.MOMENTUM_DAYS - 1])
         if price_then == 0:
             return None
@@ -189,6 +259,11 @@ def _score_stock(ticker: str, df: pd.DataFrame) -> Optional[dict]:
             config.WEIGHT_MOMENTUM * momentum_score
         )
 
+        # ── Soft scoring bonus for $5–$50 stocks ─────────────────────────────
+        # Cheap stocks allow buying more shares → larger absolute $ per signal.
+        if config.PRICE_MIN <= price_now <= config.PRICE_MAX_PREFERRED:
+            composite += 0.10
+
         return {
             "ticker":        ticker,
             "company_name":  get_company_name(ticker),
@@ -214,7 +289,7 @@ def run_morning_scan() -> List[dict]:
       3. Score each stock
       4. Return the top N ranked stocks
     """
-    tickers = get_sp500_tickers()
+    tickers = get_extended_tickers()
     if not tickers:
         logger.error("No tickers available — aborting scan.")
         return []
@@ -252,7 +327,7 @@ def run_auto_scan() -> list:
     """
     import ta as ta_lib
 
-    tickers = get_sp500_tickers()
+    tickers = get_extended_tickers()
     if not tickers:
         logger.error("Auto-scan: no tickers available.")
         return []
@@ -295,6 +370,11 @@ def run_auto_scan() -> list:
                 continue
 
             close_price = float(df["Close"].iloc[-1])
+
+            # ── Hard price cap (belt+suspenders alongside scanner filter) ─────
+            if close_price < config.PRICE_MIN or close_price > config.PRICE_MAX_HARD:
+                continue
+
             signal_date = df.index[-1].date()
 
             signals.append({

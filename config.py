@@ -99,3 +99,21 @@ MOMENTUM_DAYS = 5
 
 # ── Volume baseline ───────────────────────────────────────────────────────────
 VOLUME_AVG_DAYS = 20
+
+# ── Price Filters ─────────────────────────────────────────────────────────────
+PRICE_MIN           = 5.0    # Hard skip: stocks below $5 (too illiquid)
+PRICE_MAX_HARD      = 150.0  # Hard skip: stocks above $150 — with $5k budget,
+                             # even 1 share at $3,000 wipes 60% of capital.
+                             # $150 = max where 12% position ($600) ≥ 4 shares.
+PRICE_MAX_PREFERRED = 50.0   # Soft scoring bonus for stocks in the $5–$50 range
+MIN_AVG_VOLUME      = 200_000  # Hard skip: under 200K avg daily volume = illiquid
+
+# ── Position Sizing ───────────────────────────────────────────────────────────
+DAILY_PROFIT_TARGET       = 40.0  # Target $ profit per winning trade
+MAX_POSITION_PCT_HARD_CAP = 0.15  # Never exceed 15% of portfolio in one position
+MIN_SHARES_REQUIRED       = 3     # Skip trade if can't buy at least 3 shares
+                                  # within position cap (prevents 1-share AZO traps)
+
+# ── Extended Universe ─────────────────────────────────────────────────────────
+EXTENDED_UNIVERSE_ENABLED = True
+NASDAQ100_WIKIPEDIA_URL   = "https://en.wikipedia.org/wiki/Nasdaq-100"

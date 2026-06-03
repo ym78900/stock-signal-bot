@@ -102,8 +102,22 @@ async def job_execute_trades(bot):
             skipped.append(f"{ticker} (earnings {earn_date})")
             continue
 
-        # Position sizing from live equity
-        qty = max(1, int((equity * config.MAX_POSITION_PCT) / close_price))
+        # Position sizing — ATR-based to target $40/trade, hard-capped at 15%
+        from signals import calculate_position_size
+        qty = calculate_position_size(
+            entry_price     = close_price,
+            atr             = atr,
+            atr_target_mult = config.ATR_TARGET_MULTIPLIER,
+            profit_target   = config.DAILY_PROFIT_TARGET,
+            portfolio_value = equity,
+            hard_cap_pct    = config.MAX_POSITION_PCT_HARD_CAP,
+            min_shares      = config.MIN_SHARES_REQUIRED,
+        )
+
+        if qty == 0:
+            logger.info(f"Skipping {ticker} @ ${close_price:.2f} — too expensive for position cap")
+            skipped.append(f"{ticker} (price too high for position cap)")
+            continue
 
         stop_price   = round(close_price - atr * config.ATR_STOP_MULTIPLIER,   2)
         target_price = round(close_price + atr * config.ATR_TARGET_MULTIPLIER, 2)

@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from typing import Optional, List
 import pandas as pd
@@ -262,8 +263,56 @@ def analyse(ticker: str, df: pd.DataFrame, company_name: Optional[str] = None) -
     return result
 
 
-def run_signal_check(watchlist: List[dict]) -> List[dict]:
+def calculate_position_size(
+    entry_price: float,
+    atr: float,
+    atr_target_mult: float,
+    profit_target: float = 40.0,
+    portfolio_value: float = 5000.0,
+    hard_cap_pct: float = 0.15,
+    min_shares: int = 3,
+) -> int:
     """
+    Return the number of shares to buy so that a winning trade (price moves
+    ATR × atr_target_mult) earns exactly profit_target dollars.
+
+    Hard-capped at hard_cap_pct of portfolio_value.
+    Returns 0 if the stock is too expensive to buy min_shares within the cap
+    (caller should skip the trade — do NOT force min 1 share).
+
+    Example — cheap stock:
+        $8 stock, ATR=$0.50, mult=6.0, target=$40
+        → atr_dollars = $3.00/share → shares_needed = ceil(40/3.00) = 14
+        → cap = $5,000 × 15% = $750 → max_by_cap = 93 shares
+        → result = min(14, 93) = 14 shares  ✅
+
+    Example — AZO at $3,000 (hard-filtered in scanner, but belt+suspenders):
+        $3,000 stock, ATR=$50, mult=6.0, target=$40
+        → atr_dollars = $300/share → shares_needed = ceil(40/300) = 1
+        → cap = $5,000 × 15% = $750 → max_by_cap = int(750/3000) = 0
+        → 0 < min_shares (3) → return 0  ❌ caller skips this trade
+    """
+    if atr <= 0 or atr_target_mult <= 0 or entry_price <= 0:
+        return 0
+
+    atr_dollars_per_share = atr * atr_target_mult
+
+    # Shares needed to hit profit_target at the ATR-based exit
+    shares_needed = math.ceil(profit_target / atr_dollars_per_share)
+
+    # Never exceed hard_cap_pct of portfolio in one position
+    max_shares_by_cap = int((portfolio_value * hard_cap_pct) / entry_price)
+
+    shares = min(shares_needed, max_shares_by_cap)
+
+    # If we can't buy at least min_shares, the position is not worth taking.
+    if shares < min_shares:
+        return 0
+
+    return shares
+
+
+def run_signal_check(watchlist: List[dict]) -> List[dict]:    """
     Run signal analysis on all stocks in the watchlist.
     Fetches fresh daily data for each stock and returns a list of analysis dicts.
     Only returns stocks with a BUY or SELL signal.

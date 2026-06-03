@@ -438,6 +438,8 @@ def simulate_fast(
     require_ma200_rising: bool = False,          # 200MA slope pointing upward
     bb_lower_pct_max: Optional[float] = None,   # only buy when price is within X% of BB lower band
     min_price: float = 0.0,                      # skip stocks below this price
+    max_price: float = 0.0,                      # skip stocks above this price (0 = no cap)
+    sizing_mode: str = "fixed_pct",             # "fixed_pct" or "atr_target_40"
     atr_pct_min: float = 0.0,                    # skip boring stocks (ATR/price too small)
     atr_pct_max: float = 100.0,                  # skip hyper-volatile stocks
     # ── Round 3: time-based exit ──────────────────────────────────────────────
@@ -514,6 +516,10 @@ def simulate_fast(
         if min_price > 0 and row.get("open_next", 0) < min_price:
             continue
 
+        # Hard max price cap (fixes AZO-style single-share blowups)
+        if max_price > 0 and row.get("open_next", 0) > max_price:
+            continue
+
         atr_pct = row.get("atr_pct", 0)
         if atr_pct < atr_pct_min or atr_pct > atr_pct_max:
             continue
@@ -537,7 +543,26 @@ def simulate_fast(
             continue
 
         entry_price = row["open_next"]
-        qty         = max(1, int((portfolio * max_position_pct) / entry_price))
+
+        # ── Position sizing ────────────────────────────────────────────────────
+        if sizing_mode == "atr_target_40":
+            import math
+            atr_val     = row.get("atr", 0)
+            atr_dollars = atr_val * atr_target
+            if atr_dollars > 0:
+                shares_needed = math.ceil(40.0 / atr_dollars)
+            else:
+                shares_needed = int((portfolio * max_position_pct) / entry_price)
+        else:
+            shares_needed = int((portfolio * max_position_pct) / entry_price)
+
+        # Hard cap at max_position_pct of portfolio
+        max_by_cap = int((portfolio * max_position_pct) / entry_price)
+        qty        = min(shares_needed, max_by_cap)
+
+        # Skip if can't buy at least 3 shares — avoids 1-share $3k positions
+        if qty < 3:
+            continue
         gross_pnl   = outcome["pnl_per_share"] * qty
         fees        = IBKR_FEE_PER_TRADE * 2
         net_pnl     = round(gross_pnl - fees, 2)
@@ -614,6 +639,11 @@ def _build_summary(trades: List[dict]) -> dict:
         "take_profit_exits": len([t for t in trades if t["exit_reason"] == "take_profit"]),
         "best_trade":        max(trades, key=lambda x: x["net_pnl"]),
         "worst_trade":       min(trades, key=lambda x: x["net_pnl"]),
+        "avg_daily_pnl":     round(total_pnl / max(1, (
+            (datetime.strptime(max(str(t["entry_date"])[:10] for t in trades), "%Y-%m-%d") -
+             datetime.strptime(min(str(t["entry_date"])[:10] for t in trades), "%Y-%m-%d")).days
+            * 5 // 7
+        )), 2) if trades else 0,
     }
 
 
@@ -636,6 +666,7 @@ def print_report(summary: dict, label: str = "", max_open_pos: int = MAX_OPEN_PO
     print(f"  {'Avg loser:':<25} ${summary['avg_loss']:+,.2f}")
     print(f"  {'Profit factor:':<25} {summary['profit_factor']}")
     print(f"  {'Total net P&L:':<25} ${summary['total_net_pnl']:+,.2f}  ({summary['total_return_pct']:+.1f}%)")
+    print(f"  {'Avg daily P&L:':<25} ${summary.get('avg_daily_pnl', 0):+,.2f}/day")
     print(f"  {'Final portfolio:':<25} ${summary['final_portfolio']:,.2f}")
     print(f"  {'Max drawdown:':<25} -{summary['max_drawdown_pct']:.1f}%")
     print(f"  {'Stop loss exits:':<25} {summary['stop_loss_exits']}")
@@ -1618,3 +1649,97 @@ NOTE — Earnings filter (Phase 3d):
   Skip if earnings within EARNINGS_BUFFER_DAYS (3 days).
 """)
     print("Done.")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ROUND 4 — ATR-Target $40/Trade Sizing + Price Cap (Path to $40/Day)
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("\n\n" + "=" * 65)
+    print("  ROUND 4: ATR-Target $40/Trade Sizing vs Fixed 12%")
+    print("=" * 65)
+
+    round4_results = []
+
+    R4_RSI_BUY    = 38
+    R4_RSI_SELL   = 55
+    R4_ATR_STOP   = 3.5
+    R4_ATR_TARGET = 6.0
+
+    r4_filters = dict(
+        volume_min_ratio=1.2,
+        spy_trend=spy_trend,
+        vix_data=vix_data,
+        vix_max=25,
+        spy_ma="above_50ma",
+    )
+
+    # ── 4A: Baseline (current best — 12% fixed, S&P 500 only) ────────────────
+    _, s_4a = simulate_fast(
+        enriched_2y, R4_RSI_BUY, R4_RSI_SELL, R4_ATR_STOP, R4_ATR_TARGET,
+        max_position_pct=0.12, max_open_pos=5,
+        sizing_mode="fixed_pct",
+        **r4_filters,
+    )
+    round4_results.append({"label": "4A: Baseline (12% fixed, S&P 500)", "summary": s_4a})
+    print_report(s_4a, "4A: Baseline — 12% fixed sizing, S&P 500 only")
+
+    # ── 4B: ATR-target $40/trade sizing, S&P 500 only ────────────────────────
+    _, s_4b = simulate_fast(
+        enriched_2y, R4_RSI_BUY, R4_RSI_SELL, R4_ATR_STOP, R4_ATR_TARGET,
+        max_position_pct=0.12, max_open_pos=5,
+        sizing_mode="atr_target_40",
+        **r4_filters,
+    )
+    round4_results.append({"label": "4B: ATR-target $40/trade (S&P 500 only)", "summary": s_4b})
+    print_report(s_4b, "4B: ATR-target $40/trade sizing, S&P 500 only")
+
+    # ── 4C: Hard price cap $5–$150, fixed sizing ──────────────────────────────
+    _, s_4c = simulate_fast(
+        enriched_2y, R4_RSI_BUY, R4_RSI_SELL, R4_ATR_STOP, R4_ATR_TARGET,
+        max_position_pct=0.15, max_open_pos=5,
+        sizing_mode="fixed_pct",
+        min_price=5.0, max_price=150.0,
+        **r4_filters,
+    )
+    round4_results.append({"label": "4C: Price $5–$150 hard cap, 15% fixed", "summary": s_4c})
+    print_report(s_4c, "4C: Hard price cap $5–$150 (AZO fix), fixed 15% sizing")
+
+    # ── 4D: Hard price cap + ATR-target + 15% cap ────────────────────────────
+    _, s_4d = simulate_fast(
+        enriched_2y, R4_RSI_BUY, R4_RSI_SELL, R4_ATR_STOP, R4_ATR_TARGET,
+        max_position_pct=0.15, max_open_pos=5,
+        sizing_mode="atr_target_40",
+        min_price=5.0, max_price=150.0,
+        **r4_filters,
+    )
+    round4_results.append({"label": "4D: Price $5–$150 + ATR-target $40 + 15% cap", "summary": s_4d})
+    print_report(s_4d, "4D: Hard price cap + ATR-target $40 + 15% hard cap")
+
+    # ── 4E: Hard price cap + ATR-target + 20% cap (vs 15%) ───────────────────
+    _, s_4e = simulate_fast(
+        enriched_2y, R4_RSI_BUY, R4_RSI_SELL, R4_ATR_STOP, R4_ATR_TARGET,
+        max_position_pct=0.20, max_open_pos=5,
+        sizing_mode="atr_target_40",
+        min_price=5.0, max_price=150.0,
+        **r4_filters,
+    )
+    round4_results.append({"label": "4E: Price $5–$150 + ATR-target $40 + 20% cap", "summary": s_4e})
+    print_report(s_4e, "4E: Hard price cap + ATR-target $40 + 20% hard cap")
+
+    # ── Summary comparison table ──────────────────────────────────────────────
+    print_comparison(round4_results, title="ROUND 4 SUMMARY — Path to $40/Day")
+
+    # ── Decision table ────────────────────────────────────────────────────────
+    print(f"\n  {'Scenario':<48} {'$/Day':>8}  {'Win%':>6}  {'Decision'}")
+    print(f"  {'-'*75}")
+    baseline_daily = s_4a.get("avg_daily_pnl", 0) if s_4a else 0
+    for r in round4_results:
+        s = r.get("summary") or {}
+        daily = s.get("avg_daily_pnl", 0)
+        wr    = s.get("win_rate_pct", 0)
+        delta = daily - baseline_daily
+        arrow = f"▲ +${delta:.2f}/day" if delta > 0.01 else (f"▼ ${delta:.2f}/day" if delta < -0.01 else "  baseline")
+        verdict = "✅ ADOPT" if daily >= 40 and wr >= 65 else ("⚠️  CONSIDER" if daily >= 30 else "❌ SKIP")
+        print(f"  {r['label']:<48} ${daily:>6.2f}  {wr:>5.1f}%  {arrow}  {verdict}")
+
+    print("\nRound 4 complete.")
+    print("Adopt whichever scenario hits ≥$40/day with ≥65% win rate and ≤35% max drawdown.")
