@@ -1,11 +1,17 @@
 # Stock Signal Bot — $40/Day Implementation Plan
 
-> **Commit this file to your repo** so you can access it from any PC:
-> ```bash
-> git add STOCK_BOT_IMPLEMENTATION_PLAN.md
-> git commit -m "Add $40/day implementation plan"
-> git push
-> ```
+> **STATUS: ✅ FULLY EXECUTED — June 2026**
+>
+> All changes in this plan have been implemented, backtested, and committed.
+> See `CONTEXT.md` and `automatedtradingplan.md` for current project state.
+>
+> **Outcome vs plan:**
+> - ✅ AZO bug fixed — `calculate_position_size()` in `signals.py`, min 3 shares guard
+> - ✅ Hard price cap $5–$150 — implemented in `scanner.py` + `main.py`
+> - ✅ Round 4 backtest run — ATR-target $40 sizing **not adopted** (reduces P&L by ~70%); price cap alone is the right fix
+> - ✅ NASDAQ-100 expansion — **not adopted** (Round 5: adds 13 tickers, reduces P&L $238, win rate -2.2%)
+> - ✅ Full NYSE+NASDAQ universe tested — **not adopted** (produces only 18 trades vs 78; RSI/MA filters reject most small-caps)
+> - **Final decision: S&P 500-only universe + 12% fixed sizing + $5–$150 price cap**
 
 ---
 

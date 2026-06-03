@@ -1,6 +1,6 @@
 # Stock Signal Bot
 
-A fully automated swing trading bot that scans the S&P 500 every day, generates BUY signals, and places bracket orders (entry + stop loss + take profit) automatically on Alpaca paper trading.
+A fully automated swing trading bot that scans all S&P 500 stocks every day, generates BUY signals, and places bracket orders (entry + stop loss + take profit) automatically on Alpaca paper trading.
 
 ---
 
@@ -23,18 +23,20 @@ Every trading day it:
 BUY signal fires when:
   RSI(14) < 38          — stock is oversold on daily candles
   Volume > 1.2× avg     — confirmed interest, not a quiet drift
+  20MA > 50MA           — uptrend confirmed (or golden cross)
   SPY above 50MA        — only trade in bull market conditions
   VIX < 25              — skip if fear/volatility is spiking
   No earnings ±3 days   — avoid earnings volatility
+  Price $5–$150         — within tradeable range (AZO bug fix)
 
-Entry:       Market order at next-day open (9:30 AM ET)
+Entry:       Market order at next-day open (9:25 AM ET)
 Stop loss:   Entry − (ATR × 3.5)
 Take profit: Entry + (ATR × 6.0)
-Position:    12% of portfolio per trade
+Position:    12% of portfolio per trade (min 3 shares)
 Max open:    5 positions simultaneously
 ```
 
-These parameters were confirmed across a 3-round backtesting framework on 2 years of S&P 500 data:
+Parameters confirmed across a 5-round backtesting framework on 2 years of S&P 500 data:
 - **+131.6% return** over 2 years on $5,000 starting capital
 - **74.3% win rate**
 - **3.23 profit factor**
@@ -60,8 +62,8 @@ These parameters were confirmed across a 3-round backtesting framework on 2 year
 | Command | What it does |
 |---|---|
 | `/watchlist` | Today's top scored stocks |
-| `/signal` | RSI + MA status for any ticker |
-| `/chart` | Price chart with indicators |
+| `/signal NVDA` | RSI + MA status + real-time price |
+| `/chart NVDA` | Price chart with 20MA, 50MA, RSI |
 | `/positions` | Open Alpaca positions with unrealised P&L |
 | `/trades` | Trade history + win rate + P&L |
 | `/report` | This week's performance report |
@@ -70,6 +72,7 @@ These parameters were confirmed across a 3-round backtesting framework on 2 year
 | `/resume` | Resume auto-trading |
 | `/stopall confirm` | Emergency: cancel all orders + liquidate all positions |
 | `/status` | Bot health, schedule, trading stats |
+| `/health` | Live connectivity check: Alpaca / yfinance / IBKR |
 | `/mywatchlist` | Manage a custom watchlist |
 | `/scanmywatchlist` | Scan your custom watchlist for signals |
 | `/portfolio` | IBKR positions (when connected) |
@@ -82,18 +85,19 @@ These parameters were confirmed across a 3-round backtesting framework on 2 year
 stock-signal-bot/
 ├── main.py              — Entry point, all 5 scheduled jobs
 ├── scanner.py           — Morning scan + run_auto_scan() for all 503 tickers
-├── signals.py           — RSI + MA analysis, price fetching
-├── telegram_bot.py      — All Telegram commands and channel posting
-├── charts.py            — Dark-mode price chart PNG
-├── watchlist.py         — Daily auto-generated watchlist (JSON)
+│                          + get_extended_tickers() + get_full_market_tickers()
+├── signals.py           — RSI + MA analysis, calculate_position_size(), price fetch
+├── telegram_bot.py      — All Telegram commands, channel posting, rate limiting
+├── charts.py            — Dark-mode price/RSI chart PNG (with column validation)
+├── watchlist.py         — Daily auto-generated watchlist (atomic JSON writes)
 ├── custom_watchlist.py  — Persistent custom watchlist per user
-├── ibkr.py              — IB Gateway connection (future live trading)
-├── config.py            — All constants and strategy parameters
+├── ibkr.py              — IB Gateway connection + is_connected() health check
+├── config.py            — All constants and strategy parameters — edit here only
 ├── trader.py            — Alpaca bracket order execution + circuit breakers
-├── trade_logger.py      — CSV trade log + pending queue + pause flag
+├── trade_logger.py      — CSV trade log + pending queue + pause flag (atomic writes)
 ├── reporter.py          — Weekly and inception-to-date performance reports
-├── backtester.py        — Swing strategy backtester (3-round framework complete)
-├── intraday_backtester.py — Intraday backtester (15-min, tested and concluded)
+├── backtester.py        — Swing strategy backtester (5-round framework complete)
+├── intraday_backtester.py — Intraday backtester (tested and concluded — swing wins)
 ├── .env                 — API keys (never commit)
 ├── requirements.txt     — Python dependencies
 ├── trades.csv           — All trade records (auto-created)
@@ -122,9 +126,9 @@ Switch to live by setting `PAPER_TRADING = False` after validating paper perform
 | Component | Library |
 |---|---|
 | Language | Python 3.9 |
-| Market data | yfinance (daily), Alpaca IEX (intraday/real-time) |
+| Market data | yfinance (daily), Alpaca Market Data (real-time) |
 | Indicators | ta library |
-| Order execution | alpaca-py (paper → live) |
+| Order execution | alpaca-py (paper → IBKR live) |
 | Telegram | python-telegram-bot 20.7 |
 | Scheduling | APScheduler |
 | Charts | matplotlib |
