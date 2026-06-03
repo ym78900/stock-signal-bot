@@ -27,6 +27,17 @@ def generate_chart(ticker: str, df: pd.DataFrame) -> Optional[Path]:
             df = df.copy()
             df.columns = df.columns.get_level_values(0)
 
+        # ── Column validation ─────────────────────────────────────────────────
+        required = {"Close", "High", "Low", "Open", "Volume"}
+        missing  = required - set(df.columns)
+        if missing:
+            logger.error(f"Chart generation for {ticker}: missing columns {missing}")
+            return None
+
+        if df["Close"].dropna().empty:
+            logger.error(f"Chart generation for {ticker}: Close column is all NaN")
+            return None
+
         close = df["Close"].squeeze()  # ensure it's a Series, not a DataFrame
 
         # ── Calculate indicators ──────────────────────────────────────────────

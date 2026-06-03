@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime
 from typing import List
 
@@ -20,6 +21,21 @@ import trader
 import reporter
 
 logger = logging.getLogger(__name__)
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+# Tracks last invocation timestamp per (user_id, command) pair.
+# Prevents accidental spam — each command has a 5-second cooldown per user.
+_RATE_LIMIT_SECONDS = 5
+_last_command_time: dict = {}   # { (user_id, command): timestamp }
+
+def _is_rate_limited(user_id: int, command: str) -> bool:
+    key = (user_id, command)
+    now = time.monotonic()
+    last = _last_command_time.get(key, 0)
+    if now - last < _RATE_LIMIT_SECONDS:
+        return True
+    _last_command_time[key] = now
+    return False
 
 # user_data keys for tracking search mode
 SIGNAL_SEARCH_MODE = "waiting_signal_search"
@@ -187,6 +203,8 @@ async def post_summary(bot: Bot, fired: List[dict]) -> None:
 # ── /watchlist command + callbacks ────────────────────────────────────────────
 
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _is_rate_limited(update.effective_user.id, "watchlist"):
+        return
     import scanner
     stocks = wl.get_watchlist_with_names()
     if not stocks:
@@ -263,6 +281,8 @@ async def callback_watchlist_stock(update: Update, context: ContextTypes.DEFAULT
 # ── /signal command + callbacks ──────────────────────────────────────────────
 
 async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _is_rate_limited(update.effective_user.id, "signal"):
+        return
     context.user_data[SIGNAL_SEARCH_MODE] = False
     context.user_data[CHART_SEARCH_MODE]  = False
     stocks = wl.get_watchlist_with_names()
@@ -299,6 +319,8 @@ async def callback_signal_pick(update: Update, context: ContextTypes.DEFAULT_TYP
 # ── /chart command + callbacks ────────────────────────────────────────────────
 
 async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _is_rate_limited(update.effective_user.id, "chart"):
+        return
     context.user_data[SIGNAL_SEARCH_MODE] = False
     context.user_data[CHART_SEARCH_MODE]  = False
     stocks = wl.get_watchlist_with_names()
@@ -333,17 +355,19 @@ async def callback_chart_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("Chart generation failed.")
         return
     await query.delete_message()
-    with open(chart_path, "rb") as f:
-        await query.get_bot().send_photo(
-            chat_id=query.message.chat_id,
-            photo=f,
-            caption=f"*{payload}* — Daily chart (30 days)",
-            parse_mode=ParseMode.MARKDOWN,
-        )
     try:
-        chart_path.unlink()
-    except Exception:
-        pass
+        with open(chart_path, "rb") as f:
+            await query.get_bot().send_photo(
+                chat_id=query.message.chat_id,
+                photo=f,
+                caption=f"*{payload}* — Daily chart (30 days)",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+    finally:
+        try:
+            chart_path.unlink()
+        except Exception:
+            pass
 
 
 # ── Text message handler (search input for /signal and /chart) ────────────────
@@ -419,16 +443,18 @@ async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if chart_path is None:
                 await update.message.reply_text("Chart generation failed.")
                 return
-            with open(chart_path, "rb") as f:
-                await update.message.reply_photo(
-                    photo=f,
-                    caption=f"*{ticker}* — Daily chart (30 days)",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
             try:
-                chart_path.unlink()
-            except Exception:
-                pass
+                with open(chart_path, "rb") as f:
+                    await update.message.reply_photo(
+                        photo=f,
+                        caption=f"*{ticker}* — Daily chart (30 days)",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+            finally:
+                try:
+                    chart_path.unlink()
+                except Exception:
+                    pass
         return
 
     # Multiple results — show buttons
@@ -667,7 +693,43 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
-# ── Auto-trading channel notifications ───────────────────────────────────────
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quick connectivity check: Alpaca, yfinance, IBKR, pending queue."""
+    lines = [f"*Health Check — {dual_date()} {dual_time()}*\n"]
+
+    # Alpaca
+    try:
+        from alpaca.trading.client import TradingClient
+        import os
+        tc = TradingClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"], paper=True)
+        acct = tc.get_account()
+        lines.append(f"Alpaca: OK  (equity ${float(acct.equity):,.2f})")
+    except Exception as e:
+        lines.append(f"Alpaca: FAIL — {e}")
+
+    # yfinance (quick single-ticker check)
+    try:
+        import yfinance as yf
+        df = yf.download("SPY", period="2d", interval="1d", progress=False, auto_adjust=True)
+        lines.append(f"yfinance: OK  (SPY rows={len(df)})")
+    except Exception as e:
+        lines.append(f"yfinance: FAIL — {e}")
+
+    # IBKR (non-blocking)
+    try:
+        import ibkr as ibkr_module
+        connected = ibkr_module.is_connected()
+        lines.append(f"IBKR: {'Connected' if connected else 'Not connected (expected in paper mode)'}")
+    except Exception as e:
+        lines.append(f"IBKR: N/A — {e}")
+
+    # Pending queue
+    pending = tlog.load_pending_trades()
+    paused  = tlog.is_paused()
+    lines.append(f"\nPending trades: {len(pending)}")
+    lines.append(f"Trading: {'PAUSED' if paused else 'ACTIVE'}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def post_alert(bot: Bot, text: str) -> None:
     """Post a plain alert message to the channel."""
@@ -943,8 +1005,9 @@ def build_application(token: str) -> Application:
     # /portfolio
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
 
-    # /status
+    # /status + /health
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("health", cmd_health))
 
     # ── Trading commands ──────────────────────────────────────────────────────
     app.add_handler(CommandHandler("positions", cmd_positions))
@@ -980,6 +1043,7 @@ async def register_commands(bot: Bot) -> None:
             BotCommand("testrun",          "Trigger a scheduled job now (testing)"),
             BotCommand("portfolio",        "Show your IBKR positions & P&L"),
             BotCommand("status",           "Bot status & schedule"),
+            BotCommand("health",           "Check Alpaca / yfinance connectivity"),
         ])
         logger.info("Command menu registered with Telegram.")
     except Exception as e:

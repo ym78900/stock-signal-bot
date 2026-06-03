@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+import tempfile
 from datetime import date
 from pathlib import Path
 from typing import List
@@ -28,9 +30,20 @@ def _load() -> dict:
 
 
 def _save(state: dict) -> None:
+    """Atomic write — write to temp file then rename, so no partial reads."""
     try:
-        with open(WATCHLIST_FILE, "w") as f:
-            json.dump(state, f, indent=2)
+        dir_  = WATCHLIST_FILE.parent
+        fd, tmp_path = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp_path, WATCHLIST_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
     except Exception as e:
         logger.error(f"Could not save watchlist file: {e}")
 

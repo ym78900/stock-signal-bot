@@ -87,6 +87,18 @@ def get_positions() -> Optional[List[dict]]:
     return result
 
 
+def is_connected() -> bool:
+    """Quick check: can we reach IB Gateway at all? Returns True/False."""
+    import socket
+    host = os.environ.get("IBKR_HOST", "127.0.0.1")
+    port = int(os.environ.get("IBKR_PORT", "4001"))
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except Exception:
+        return False
+
+
 def get_price(ticker: str) -> Optional[float]:
     """
     Fetch real-time price for a single ticker from IB Gateway.

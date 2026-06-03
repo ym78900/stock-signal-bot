@@ -14,6 +14,7 @@ import csv
 import json
 import logging
 import os
+import tempfile
 import uuid
 from datetime import date, datetime
 from typing import Dict, List, Optional
@@ -106,9 +107,24 @@ def queue_pending_trade(
     # Deduplicate by ticker — one pending trade per ticker at a time
     trades = [t for t in trades if t["ticker"] != ticker]
     trades.append(entry)
-    with open(PENDING_FILE, "w") as f:
-        json.dump(trades, f, indent=2)
+    _atomic_json_write(PENDING_FILE, trades)
     logger.info(f"Queued pending trade: {ticker} SL≈${stop_est} TP≈${target_est}")
+
+
+def _atomic_json_write(path: str, data) -> None:
+    """Write JSON atomically — temp file + os.replace so no partial reads."""
+    dir_  = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 def load_pending_trades() -> List[dict]:
@@ -122,15 +138,12 @@ def load_pending_trades() -> List[dict]:
 
 
 def clear_pending_trades() -> None:
-    if os.path.exists(PENDING_FILE):
-        with open(PENDING_FILE, "w") as f:
-            json.dump([], f)
+    _atomic_json_write(PENDING_FILE, [])
 
 
 def remove_pending_trade(ticker: str) -> None:
     trades = [t for t in load_pending_trades() if t["ticker"] != ticker]
-    with open(PENDING_FILE, "w") as f:
-        json.dump(trades, f, indent=2)
+    _atomic_json_write(PENDING_FILE, trades)
 
 
 # ── Trade lifecycle ───────────────────────────────────────────────────────────
