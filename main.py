@@ -304,6 +304,7 @@ async def job_monitor_positions(bot):
             if order_id:
                 trader.cancel_order(order_id)
             # Market sell to close the position
+            exit_price = None
             try:
                 from alpaca.trading.requests import MarketOrderRequest
                 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -313,11 +314,26 @@ async def job_monitor_positions(bot):
                     side          = OrderSide.SELL,
                     time_in_force = TimeInForce.DAY,
                 )
-                trader._trading_client().submit_order(req)
+                sell_order = trader._trading_client().submit_order(req)
+                # Poll briefly for the fill price so we can log it accurately
+                import asyncio as _asyncio
+                for _ in range(6):
+                    fp = trader.get_order_fill_price(str(sell_order.id))
+                    if fp:
+                        exit_price = fp
+                        break
+                    await _asyncio.sleep(10)
                 msg = f"⏱ {ticker}: max hold ({days_held} days) reached — position closed at market."
                 await tbot.post_alert(bot, msg)
             except Exception as e:
                 logger.error(f"Max hold market sell failed for {ticker}: {e}")
+            # Mark the trade closed in trades.csv so the monitor stops tracking it
+            tlog.mark_trade_closed(
+                alpaca_order_id = order_id or trade.get("alpaca_order_id", ""),
+                exit_price      = exit_price or 0.0,
+                exit_date       = str(today),
+                exit_reason     = "max_hold",
+            )
 
     # ── Check for trailing stop fills ─────────────────────────────────────────
     closed = trader.get_closed_bracket_legs(tracked_ids)
@@ -386,9 +402,10 @@ async def main():
         args=[bot], id="signal_check", misfire_grace_time=300,
     )
     # Monitor positions every 15 min from 4:30 PM to 11:00 PM Finnish
+    # hour="16-23" covers full market session (closes 23:00 Finnish / 4:00 PM ET)
     scheduler.add_job(
         job_monitor_positions, trigger="cron",
-        hour="16-22", minute=f"*/{config.MONITOR_INTERVAL_MINUTES}",
+        hour="16-23", minute=f"*/{config.MONITOR_INTERVAL_MINUTES}",
         args=[bot], id="monitor_positions", misfire_grace_time=60,
     )
     # Weekly report — Sunday 8:00 PM Finnish

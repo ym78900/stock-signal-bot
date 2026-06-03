@@ -8,12 +8,37 @@ without re-explaining anything. Read this fully before making any changes.
 ## What this project is
 
 A fully automated Python swing trading bot that:
-- Scans S&P 500 + NASDAQ-100 (~600 tickers) every trading day
+- Scans the S&P 500 (~503 tickers) every trading day
 - Places bracket orders (entry + stop loss + take profit) automatically on Alpaca paper trading
 - Monitors open positions and notifies via Telegram when a stop or target is hit
 - Posts weekly performance reports to a private Telegram channel
 
 **The bot executes trades automatically. The user does not act manually.**
+
+---
+
+## ⚠️ CRITICAL CORRECTION (Round 8 — June 2026)
+
+The headline backtest numbers used through Round 7 (+$25,041, +500%, ~$48/day)
+were **fictional artifacts of a backtester bug**. `simulate_fast()` never called
+`open_tickers.add()`, so it ran with **unlimited concurrent positions and zero
+capital constraint** — it compounded 500+ trades as if a $5,000 account could
+hold unlimited overlapping 30–60 day positions and recycle capital instantly.
+
+A new time-aware simulator (`simulate_concurrent()`) models real entry→exit
+windows, the position cap, and a cash constraint. **Corrected reality:**
+
+| Metric | Old (buggy) | Corrected (cap=7, $5k) |
+|---|---|---|
+| 2-year P&L | +$25,041 (+500%) | **~+$1,500–2,000 (+30–40%)** |
+| Per day | ~$48/day | **~$3/day** |
+
+**Implication for the €40/day goal:** returns are ~13%/yr and scale linearly
+with capital. €40/day (~$43/day) requires **~$60–70k of capital**, not $5k.
+Compounding $5k→$70k at ~13%/yr takes **~20 years**, not 22 months. The strategy
+is sound and profitable; the original target was built on the inflated numbers.
+
+See `automatedtradingplan.md` → "Round 8" for full detail.
 
 ---
 
@@ -33,7 +58,7 @@ A fully automated Python swing trading bot that:
 | RSI timeframe | Daily candles only (`interval="1d"`) | Reliable, matches swing hold periods |
 | Signal timing | Post-close only (11:15 PM Finnish) | New daily candles finalize at market close |
 | Universe | S&P 500 only (~503 tickers) | Round 5 backtest: NASDAQ-100 adds 13 tickers and reduces P&L; full NYSE+NASDAQ produces 18 trades vs 78 — filters reject most small-caps |
-| Price filter | Hard skip below $5 or above $200 | Round 7 full-window backtest: $200 = best P&L ($25,041), best PF (1.93), lowest DD (19.2%) across all caps tested |
+| Price filter | Hard skip below $5 or above $200 | Round 7 full-window backtest: $200 = best P&L, best PF, lowest DD across all caps tested (see Round 8 note: absolute P&L figures were inflated, but the *relative* ranking of caps still holds) |
 | Position sizing | ATR-based `calculate_position_size()` targeting $40/trade, 15% hard cap | Replaces broken `max(1, int(...))` formula |
 | Min shares | 3 shares minimum | Skip trade if can't buy ≥3 within position cap |
 | Data library | yfinance (unofficial Yahoo Finance) | Free, reliable for daily candles |
@@ -41,7 +66,7 @@ A fully automated Python swing trading bot that:
 | Indicators | `ta` library (NOT pandas-ta) | pandas-ta dropped Python 3.9 support |
 | State storage | Local JSON (atomic writes via `os.replace`) | Simple, race-condition safe |
 | Intraday | Permanently shelved | Backtested — swing wins on every metric |
-| ATR-based exits | Stop × 3.5, Target × 6.0 | Confirmed best across 3-round backtest framework |
+| ATR-based exits | Trailing stop × 3.5 ATR (live) | Round 7+8: trailing beats fixed Stop×3.5/Target×6.0. 3.0× trail rejected — failed split-half robustness check |
 | MACD | Permanently dropped | Mutually exclusive with oversold RSI — 0 trades |
 
 ---
@@ -117,7 +142,8 @@ ATR_TARGET_MULTIPLIER     = 6.0
 
 MAX_POSITION_PCT          = 0.12   # used in backtester baseline only
 MAX_POSITION_PCT_HARD_CAP = 0.15   # live hard cap (15% of equity max per trade)
-MAX_OPEN_POSITIONS        = 5
+MAX_OPEN_POSITIONS        = 7      # Round 8: 7 beats 5 on P&L at similar DD
+EXTENDED_UNIVERSE_ENABLED = False   # Round 5: S&P 500 only
 CONSECUTIVE_LOSS_LIMIT    = 3
 DAILY_PROFIT_TARGET       = 40.0   # target $ per winning trade for sizing
 
@@ -133,8 +159,12 @@ VIX_MAX                   = 25
 USE_EARNINGS_FILTER       = True
 EARNINGS_BUFFER_DAYS      = 3
 USE_MACD_CONFIRMATION     = False   # permanently off
-EXTENDED_UNIVERSE_ENABLED = True    # S&P 500 + NASDAQ-100
 ```
+
+**Exit mode (live):** trailing stop at **3.5× ATR** (ratcheting). Round 7 + Round 8
+both confirm the trailing stop beats the old fixed Stop×3.5 / Target×6.0 OCO exit.
+A 3.0× trail looked marginally better on the full window but **failed a split-half
+robustness check** (3.5× won decisively in the first half) → 3.5× kept.
 
 ---
 
@@ -150,10 +180,13 @@ EXTENDED_UNIVERSE_ENABLED = True    # S&P 500 + NASDAQ-100
 | Round 4 | ATR-target sizing, price cap $5–$150 | Baseline still best total profit; price cap fixes AZO bug |
 | Round 5 | Universe size: S&P 500 vs +NASDAQ-100 vs full NYSE+NASDAQ (5,177 tickers) | S&P 500 wins decisively. Full market: only 18 trades, P&L ▼$2,144 vs baseline. NASDAQ-100 adds nothing. S&P 500-only confirmed. |
 | Round 6 | Price cap variants: $150 vs $200 vs $250 vs no cap | BUGGED — consecutive-loss sim only measured first ~100 trades. Results were not representative. |
-| Round 7 | Fixed consecutive-loss bug (auto-resume after 7 days). Re-ran full 2-year window. | $200 cap wins: 506 trades, 58.5% win, PF 1.93, +$25,041, DD 19.2%. Trailing stop 3.5x also beats fixed target (+$31,712, DD 15.5%, PF 2.44) — pending implementation decision. |
+| Round 7 | Fixed consecutive-loss bug. Re-ran full 2-year window. | $200 cap wins; trailing stop 3.5× beats fixed target. **NOTE: absolute P&L figures (+$25,041 / +$31,712) were later found to be inflated by the `simulate_fast()` cap/cash bug — see Round 8. The *relative* rankings (price cap, trailing > fixed) still hold.** |
+| Round 8 | **Bug fix: built `simulate_concurrent()` (time-aware, enforces position cap + cash constraint). Re-ran position-limit, sizing, exit-speed, and trailing experiments.** | Corrected 2-year P&L on $5k ≈ **+$1,500–2,000 (~$3/day)**, not +$25k. Position cap **5→7** improves P&L (+$818→+$1,264) at similar DD (~8%). Trailing **3.5×** validated (+$1,568, 51.5% win, DD 10.5%, PF 1.86). 3.0× trail rejected (failed split-half robustness). Size 12–15% optimal. |
 
-**Confirmed best (Round 7 full-window baseline):**
-- Return: +$25,041 (+500.8%) over 2 years | Win rate: 58.5% | Profit factor: 1.93 | Max drawdown: 19.2% | 506 trades
+**Confirmed best (Round 8 corrected — cap=7, 12% size, $5k, trailing 3.5× ATR):**
+- Return: **+$1,568 (+31.4%)** over 2 years | Win rate: 51.5% | Profit factor: 1.86 | Max drawdown: 10.5% | 101 trades | **~$3.11/day**
+- Capital scaling (linear, ~13%/yr): $5k → ~$2.51/day · $50k → ~$29.65/day · $100k → ~$59.96/day
+- **€40/day (~$43/day) needs ~$60–70k capital.** Strategy is sound; the goal timeline was reset off the corrected numbers.
 
 **Round 4 key finding:** ATR-target $40/trade sizing reduces per-trade variance (avg win $37, avg loss $27, DD -1.3%) but also reduces 2-year total P&L by ~70%. Price cap alone ($5–$150) is the correct fix — adopted for live. ATR-target sizing not adopted.
 
@@ -284,11 +317,11 @@ cd ~/Desktop/stock-signal-bot
 
 - [x] Fully automated trading pipeline: scan → queue → bracket order → monitor
 - [x] 5 circuit breakers: VIX, SPY trend, consecutive loss pause, position limits, earnings filter
-- [x] ATR-based stop/target sizing (Stop: Entry−ATR×3.5, Target: Entry+ATR×6.0)
+- [x] ATR-based exits: **trailing stop at 3.5× ATR (ratcheting)** — replaces fixed OCO target
 - [x] Position sizing via `calculate_position_size()` — AZO bug fixed, min 3 shares enforced
-- [x] Price cap $5–$250 in scanner + auto-scan (hard filter, raised from $150 in Round 6)
-- [x] NASDAQ-100 expansion — ~600 tickers in universe
-- [x] 4-round backtesting framework complete — all parameters locked
+- [x] Price cap $5–$200 in scanner + auto-scan (hard filter)
+- [x] S&P 500 universe (~503 tickers) — NASDAQ-100 expansion disabled (Round 5)
+- [x] 8-round backtesting framework complete — all parameters locked (Round 8 corrected the cap/cash bug)
 - [x] CSV trade logging, pending queue with atomic JSON writes
 - [x] Telegram bot with full command set + 5s rate limiting on /signal /chart /watchlist
 - [x] /health command — live connectivity check for Alpaca, yfinance, IBKR

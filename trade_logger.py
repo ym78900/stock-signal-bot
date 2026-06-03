@@ -211,8 +211,8 @@ def update_entry_price(alpaca_order_id: str, entry_price: float, entry_date: str
 def update_trade_after_fill(
     entry_order_id: str,
     fill_price: float,
-    stop_price: float,
-    target_price: float,
+    stop_price: Optional[float],
+    target_price: Optional[float],
     oco_order_id: str,
 ) -> bool:
     """
@@ -234,8 +234,8 @@ def update_trade_after_fill(
         if row["alpaca_order_id"] == entry_order_id and row["status"] == "open":
             row["entry_price"]     = fill_price
             row["entry_date"]      = str(date.today())
-            row["stop_price"]      = stop_price
-            row["target_price"]    = target_price
+            row["stop_price"]      = stop_price if stop_price is not None else ""
+            row["target_price"]    = target_price if target_price is not None else ""
             row["alpaca_order_id"] = oco_order_id   # switch to OCO id for exit tracking
             updated = True
             logger.info(

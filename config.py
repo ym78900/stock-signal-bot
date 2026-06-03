@@ -89,7 +89,10 @@ MA_SLOW = 50               # Slow moving average (days)
 # Confirmed best in Round 1 grid search (900 combinations, 2-year backtest):
 #  12% → +131.6% return, PF 3.23, DD -3.4%  ← BEST
 MAX_POSITION_PCT        = 0.12   # 12% of account equity per trade
-MAX_OPEN_POSITIONS      = 5      # Circuit breaker — skip new signals if N already open
+MAX_OPEN_POSITIONS      = 7      # Circuit breaker — skip new signals if N already open
+                                  # Round 8 (concurrency-aware sim): 7 beats 5 on P&L
+                                  # (+$1,264 vs +$818 / 2yr) at similar DD (7.9%) & better PF (1.71).
+                                  # Natural peak concurrency is ~13; cash constraint caps deployment.
 CONSECUTIVE_LOSS_LIMIT  = 3      # Pause auto-trading after N consecutive losses
                                   # (unlimited → -82.7% DD; limit=2 too conservative)
 

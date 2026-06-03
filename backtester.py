@@ -455,6 +455,75 @@ def precompute_exits(
     return enriched
 
 
+# ── Step 3b: Precompute TRAILING-STOP exit outcomes ─────────────────────────────
+
+def attach_trailing_exits(
+    enriched: List[dict],
+    processed: Dict[str, pd.DataFrame],
+    trail_mults: List[float],
+    max_hold_days: int = 60,
+) -> List[dict]:
+    """
+    Attach trailing-stop exit outcomes to each enriched row, keyed by trail
+    multiplier: row["trail_outcomes"][mult] = {exit_price, exit_reason, days_held,
+    pnl_per_share}.
+
+    This models the LIVE exit (Alpaca TrailingStopOrderRequest, trail = ATR × mult):
+      - trail_amt = ATR × mult  (absolute dollar trail, fixed at entry)
+      - stop starts at entry − trail_amt
+      - each day the stop ratchets up to (highest high seen − trail_amt), never down
+      - exit when a day's low touches the current stop level
+
+    Daily-bar approximation: within a day we check the stop (using the peak through
+    the prior day) BEFORE raising the peak with today's high — the conservative
+    assumption that the low can precede the high intraday.
+
+    Mutates and returns the same enriched list (no separate cache — fast single pass).
+    """
+    logger.info(f"Attaching trailing-stop outcomes for {len(trail_mults)} trail mult(s)...")
+    for row in enriched:
+        df = processed.get(row["ticker"])
+        if df is None:
+            row["trail_outcomes"] = {}
+            continue
+        entry_idx   = row["date_idx"] + 1
+        entry_price = row["open_next"]
+        atr         = row["atr"]
+        end_idx     = min(entry_idx + max_hold_days, len(df))
+        highs = df["High"].iloc[entry_idx:end_idx].values
+        lows  = df["Low"].iloc[entry_idx:end_idx].values
+        closes = df["Close"].iloc[entry_idx:end_idx].values
+
+        outcomes = {}
+        for mult in trail_mults:
+            trail_amt = atr * mult
+            peak      = entry_price
+            stop      = entry_price - trail_amt
+            exit_price  = None
+            exit_reason = "end_of_data"
+            days_held   = len(highs)
+            for d in range(len(highs)):
+                if lows[d] <= stop:
+                    exit_price  = stop
+                    exit_reason = "trailing_stop"
+                    days_held   = d + 1
+                    break
+                if highs[d] > peak:
+                    peak = highs[d]
+                    stop = peak - trail_amt
+            if exit_price is None and len(closes) > 0:
+                exit_price  = float(closes[-1])
+                exit_reason = "max_hold" if len(highs) >= (end_idx - entry_idx) else "end_of_data"
+            outcomes[mult] = {
+                "exit_price":    round(exit_price, 2) if exit_price is not None else entry_price,
+                "exit_reason":   exit_reason,
+                "days_held":     days_held,
+                "pnl_per_share": (exit_price - entry_price) if exit_price is not None else 0.0,
+            }
+        row["trail_outcomes"] = outcomes
+    return enriched
+
+
 # ── Step 4: Fast simulation ─────────────────────────────────────────────────────
 
 def simulate_fast(
@@ -669,6 +738,283 @@ def simulate_fast(
         })
 
     return trades, _build_summary(trades)
+
+
+# ── Shared filter test ─────────────────────────────────────────────────────────
+
+def _row_passes_filters(
+    row: dict,
+    rsi_buy: float,
+    volume_min_ratio: Optional[float] = None,
+    spy_trend: Optional[Dict] = None,
+    spy_ma: str = "above_50ma",
+    require_macd_cross: bool = False,
+    require_macd_above: bool = False,
+    vix_data: Optional[Dict] = None,
+    vix_max: Optional[float] = None,
+    require_rsi_rising: bool = False,
+    require_price_above_200ma: bool = False,
+    require_consecutive_rsi: bool = False,
+    require_ma200_rising: bool = False,
+    bb_lower_pct_max: Optional[float] = None,
+    min_price: float = 0.0,
+    max_price: float = 0.0,
+    atr_pct_min: float = 0.0,
+    atr_pct_max: float = 100.0,
+) -> bool:
+    """
+    Return True if a precomputed row passes the core signal + all active filters.
+    Mirrors the filter block inside simulate_fast() exactly so both simulators
+    select identical signals. Sizing/exit lookup are handled by the caller.
+    """
+    golden_cross = row["prev_ma_fast"] <= row["prev_ma_slow"] and row["ma_fast"] > row["ma_slow"]
+    if not (row["rsi"] < rsi_buy and (row["ma_fast"] > row["ma_slow"] or golden_cross)):
+        return False
+
+    if volume_min_ratio is not None and row.get("volume_ratio", 0) < volume_min_ratio:
+        return False
+
+    if spy_trend is not None:
+        dk = row["date"]
+        spy_day = spy_trend.get(dk) or spy_trend.get(pd.Timestamp(dk))
+        if spy_day is None:
+            return False
+        if isinstance(spy_day, bool):
+            if not spy_day:
+                return False
+        else:
+            if not spy_day.get(spy_ma, True):
+                return False
+
+    if vix_data is not None and vix_max is not None:
+        dk = row["date"]
+        vix_val = vix_data.get(dk) or vix_data.get(pd.Timestamp(dk))
+        if vix_val is not None and vix_val >= vix_max:
+            return False
+
+    if require_macd_cross and not row.get("macd_cross", False):
+        return False
+    if require_macd_above and not row.get("macd_above", False):
+        return False
+    if require_rsi_rising and row.get("rsi", 0) <= row.get("prev_rsi", 0):
+        return False
+    if require_price_above_200ma and not row.get("price_above_200ma", True):
+        return False
+    if require_ma200_rising and not row.get("ma200_rising", True):
+        return False
+    if require_consecutive_rsi and row.get("prev_rsi", rsi_buy + 1) >= rsi_buy:
+        return False
+    if bb_lower_pct_max is not None and row.get("bb_lower_pct", 999) > bb_lower_pct_max:
+        return False
+    if min_price > 0 and row.get("open_next", 0) < min_price:
+        return False
+    if max_price > 0 and row.get("open_next", 0) > max_price:
+        return False
+
+    atr_pct = row.get("atr_pct", 0)
+    if atr_pct < atr_pct_min or atr_pct > atr_pct_max:
+        return False
+
+    return True
+
+
+# ── Time-aware concurrent simulator (Round 8) ──────────────────────────────────
+
+def _to_date(v):
+    """Normalise a Timestamp / str / date to a datetime.date for comparison."""
+    import datetime as _dt
+    if v is None:
+        return None
+    if hasattr(v, "date"):
+        try:
+            return v.date()
+        except Exception:
+            pass
+    try:
+        return _dt.date.fromisoformat(str(v)[:10])
+    except Exception:
+        return None
+
+
+def _df_date_col(df) -> Optional[str]:
+    if "Date" in df.columns:
+        return "Date"
+    if "index" in df.columns:
+        return "index"
+    return None
+
+
+def simulate_concurrent(
+    enriched_rows: List[dict],
+    processed: Dict[str, pd.DataFrame],
+    rsi_buy: float,
+    rsi_sell: float,
+    atr_stop: float,
+    atr_target: float,
+    max_open_pos: int = MAX_OPEN_POSITIONS,
+    max_position_pct: float = MAX_POSITION_PCT,
+    consec_loss_limit: int = CONSECUTIVE_LOSS_LIMIT,
+    sizing_mode: str = "fixed_pct",
+    enforce_cash: bool = True,
+    trail_mult: Optional[float] = None,
+    **filter_kwargs,
+) -> Tuple[List[dict], dict]:
+    """
+    Event-driven backtest that correctly models concurrent positions over time.
+
+    This is the FIX for the simulate_fast() open_tickers bug: that function never
+    called open_tickers.add(), so max_open_pos was never enforced and every signal
+    was effectively taken sequentially. Here we track each position's entry date
+    and real exit date (from the processed price frame), so:
+
+      - max_open_pos is genuinely enforced (slot frees only when a position exits)
+      - the same ticker can't be held twice concurrently
+      - P&L is realised at EXIT time (not signal time), so position sizing and the
+        consecutive-loss counter see the correct chronological portfolio value
+      - optional cash constraint prevents deploying more than 100% of equity
+
+    Exit dates come from processed[ticker]["Date"] at entry_idx + days_held - 1,
+    so no cache regeneration is required.
+    """
+    import datetime as _dt
+    import math
+
+    # ── Build filtered candidate list with entry + exit dates ──────────────────
+    candidates = []   # (entry_date, exit_date, row, outcome)
+    for row in enriched_rows:
+        if not _row_passes_filters(row, rsi_buy, **filter_kwargs):
+            continue
+        if trail_mult is not None:
+            outcome = row.get("trail_outcomes", {}).get(trail_mult)
+        else:
+            outcome = row["exit_outcomes"].get((atr_stop, atr_target))
+        if not outcome:
+            continue
+        entry_date = _to_date(row["date_next"])
+        if entry_date is None:
+            continue
+        df = processed.get(row["ticker"])
+        if df is None:
+            continue
+        date_col = _df_date_col(df)
+        if date_col is None:
+            continue
+        entry_idx = row["date_idx"] + 1
+        exit_idx  = min(entry_idx + int(outcome["days_held"]) - 1, len(df) - 1)
+        if exit_idx < 0:
+            continue
+        exit_date = _to_date(df[date_col].iloc[exit_idx])
+        if exit_date is None or exit_date < entry_date:
+            exit_date = entry_date
+        candidates.append((entry_date, exit_date, row, outcome))
+
+    candidates.sort(key=lambda c: c[0])
+
+    # ── Event-driven walk ──────────────────────────────────────────────────────
+    portfolio          = STARTING_CAPITAL
+    open_positions     = []   # list of dicts: ticker, exit_date, net_pnl, win, cost, trade
+    trades             = []
+    consecutive_losses = 0
+    paused_until       = None
+    peak_concurrent    = 0
+
+    def _close_due(current_date):
+        nonlocal portfolio, consecutive_losses
+        due = [p for p in open_positions if p["exit_date"] <= current_date]
+        due.sort(key=lambda p: p["exit_date"])
+        for p in due:
+            open_positions.remove(p)
+            portfolio += p["net_pnl"]
+            if p["win"]:
+                consecutive_losses = 0
+            else:
+                consecutive_losses += 1
+            trades.append(p["trade"])
+
+    for entry_date, exit_date, row, outcome in candidates:
+        _close_due(entry_date)
+
+        # Consecutive-loss pause (auto-resume after 7 days — simulates /resume)
+        if consecutive_losses >= consec_loss_limit:
+            if paused_until is None:
+                paused_until = entry_date + _dt.timedelta(days=7)
+            if entry_date <= paused_until:
+                continue
+            consecutive_losses = 0
+            paused_until = None
+
+        ticker = row["ticker"]
+        if any(p["ticker"] == ticker for p in open_positions):
+            continue
+        if len(open_positions) >= max_open_pos:
+            continue
+
+        entry_price = row["open_next"]
+        if entry_price <= 0:
+            continue
+
+        # Position sizing (mirrors simulate_fast)
+        if sizing_mode == "atr_target_40":
+            atr_dollars = row.get("atr", 0) * atr_target
+            shares_needed = (math.ceil(40.0 / atr_dollars) if atr_dollars > 0
+                             else int((portfolio * max_position_pct) / entry_price))
+        else:
+            shares_needed = int((portfolio * max_position_pct) / entry_price)
+        max_by_cap = int((portfolio * max_position_pct) / entry_price)
+        qty = min(shares_needed, max_by_cap)
+
+        # Cash constraint: never deploy more than available (equity − open cost)
+        if enforce_cash:
+            deployed = sum(p["cost"] for p in open_positions)
+            avail    = portfolio - deployed
+            qty      = min(qty, int(avail / entry_price))
+
+        if qty < 3:
+            continue
+
+        gross_pnl = outcome["pnl_per_share"] * qty
+        fees      = IBKR_FEE_PER_TRADE * 2
+        net_pnl   = round(gross_pnl - fees, 2)
+        cost      = entry_price * qty
+        pnl_pct   = round((net_pnl / cost) * 100, 2) if cost else 0
+
+        ed = row["date_next"]
+        if hasattr(ed, "date"):
+            ed = str(ed.date())
+
+        trade = {
+            "ticker":      ticker,
+            "entry_date":  ed,
+            "entry_price": entry_price,
+            "exit_price":  outcome["exit_price"],
+            "stop_loss":   round(entry_price - row["atr"] * atr_stop, 2),
+            "take_profit": round(entry_price + row["atr"] * atr_target, 2),
+            "qty":         qty,
+            "net_pnl":     net_pnl,
+            "pnl_pct":     pnl_pct,
+            "exit_reason": outcome["exit_reason"],
+            "days_held":   outcome["days_held"],
+            "win":         net_pnl > 0,
+        }
+        open_positions.append({
+            "ticker":    ticker,
+            "exit_date": exit_date,
+            "net_pnl":   net_pnl,
+            "win":       net_pnl > 0,
+            "cost":      cost,
+            "trade":     trade,
+        })
+        peak_concurrent = max(peak_concurrent, len(open_positions))
+
+    # Close any still-open positions (chronological by exit date)
+    for p in sorted(open_positions, key=lambda p: p["exit_date"]):
+        portfolio += p["net_pnl"]
+        trades.append(p["trade"])
+
+    summary = _build_summary(trades)
+    if summary:
+        summary["peak_concurrent_positions"] = peak_concurrent
+    return trades, summary
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
