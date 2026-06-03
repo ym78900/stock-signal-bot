@@ -1,11 +1,21 @@
 """
-trader.py — Alpaca paper/live bracket order execution for the swing strategy.
+trader.py — Alpaca paper/live order execution for the swing strategy.
 
 Responsibilities:
-  - Place bracket orders (market entry + stop loss + take profit)
+  - Place market buy orders (entry)
+  - Place OCO exit orders (stop loss + take profit) based on real fill price
   - Check circuit breakers before every order
   - Detect closed positions and return them for logging
   - Emergency stop (cancel all + liquidate)
+
+Order flow (two-step, fill-based):
+  1. Place market buy at 9:25 AM ET (queues for market open at 9:30 AM ET)
+  2. After market opens, poll for real fill price
+  3. Calculate stop = fill − ATR×3.5, target = fill + ATR×6.0 from ACTUAL fill
+  4. Place OCO exit: limit sell at target + stop sell at stop_price
+
+This avoids the overnight-gap problem where yesterday's close ≠ actual fill price,
+which would cause the stop/target distances to be unbalanced.
 
 Circuit breakers (checked at execution time, 9:25 AM ET):
   1. VIX ≥ 25            → skip all trades today
@@ -199,20 +209,16 @@ def run_circuit_breakers() -> Tuple[bool, str]:
 
 # ── Order placement ───────────────────────────────────────────────────────────
 
-def place_bracket_order(
-    ticker: str,
-    qty: int,
-    stop_price: float,
-    target_price: float,
-) -> Optional[str]:
+def place_market_buy(ticker: str, qty: int) -> Optional[str]:
     """
-    Place a bracket order: market buy + stop loss + take profit.
+    Step 1 of 2: Place a simple market buy with no attached stop/target.
     Returns the Alpaca order ID string, or None on failure.
 
-    Stop and target prices are absolute dollar values based on prior close + ATR.
+    The order queues pre-market and fills at/near the 9:30 AM ET open.
+    After fill is confirmed, call place_oco_exit() with the real fill price.
     """
     try:
-        from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+        from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
         req = MarketOrderRequest(
@@ -220,18 +226,83 @@ def place_bracket_order(
             qty           = qty,
             side          = OrderSide.BUY,
             time_in_force = TimeInForce.DAY,
-            order_class   = OrderClass.BRACKET,
-            take_profit   = TakeProfitRequest(limit_price=round(target_price, 2)),
+            order_class   = OrderClass.SIMPLE,
+        )
+        order = _trading_client().submit_order(req)
+        logger.info(f"Market buy placed: {ticker} qty={qty}  id={order.id}")
+        return str(order.id)
+    except Exception as e:
+        logger.error(f"Failed to place market buy for {ticker}: {e}")
+        return None
+
+
+def get_order_fill_price(order_id: str) -> Optional[float]:
+    """
+    Return the average fill price of an order if it has been filled, else None.
+    Used to poll for fill after a market buy.
+    """
+    try:
+        order  = _trading_client().get_order_by_id(order_id)
+        status = str(order.status).lower()
+        if status in ("filled", "partially_filled") and order.filled_avg_price:
+            return round(float(order.filled_avg_price), 4)
+        return None
+    except Exception as e:
+        logger.error(f"get_order_fill_price({order_id}): {e}")
+        return None
+
+
+def cancel_order(order_id: str) -> bool:
+    """Cancel a specific open order. Returns True on success."""
+    try:
+        _trading_client().cancel_order_by_id(order_id)
+        logger.info(f"Cancelled order {order_id}")
+        return True
+    except Exception as e:
+        logger.error(f"cancel_order({order_id}): {e}")
+        return False
+
+
+def place_oco_exit(
+    ticker: str,
+    qty: int,
+    stop_price: float,
+    target_price: float,
+) -> Optional[str]:
+    """
+    Step 2 of 2: Place an OCO (One-Cancels-Other) sell order after the entry fill.
+
+    Creates two linked sell orders:
+      - Limit sell at target_price  (take profit)
+      - Stop  sell at stop_price    (stop loss)
+    When either fills, Alpaca automatically cancels the other.
+
+    stop_price and target_price must be calculated from the REAL fill price,
+    not the prior close estimate.
+
+    Returns the OCO order ID (used to track exits), or None on failure.
+    """
+    try:
+        from alpaca.trading.requests import LimitOrderRequest, StopLossRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+
+        req = LimitOrderRequest(
+            symbol        = ticker,
+            qty           = qty,
+            side          = OrderSide.SELL,
+            time_in_force = TimeInForce.GTC,
+            order_class   = OrderClass.OCO,
+            limit_price   = round(target_price, 2),
             stop_loss     = StopLossRequest(stop_price=round(stop_price, 2)),
         )
         order = _trading_client().submit_order(req)
         logger.info(
-            f"Bracket order placed: {ticker} qty={qty} "
+            f"OCO exit placed: {ticker} qty={qty} "
             f"SL=${stop_price:.2f} TP=${target_price:.2f}  id={order.id}"
         )
         return str(order.id)
     except Exception as e:
-        logger.error(f"Failed to place bracket order for {ticker}: {e}")
+        logger.error(f"Failed to place OCO exit for {ticker}: {e}")
         return None
 
 

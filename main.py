@@ -45,7 +45,15 @@ async def job_morning_scan(bot):
 async def job_execute_trades(bot):
     """
     Job 2 — 4:25 PM Finnish / 9:25 AM ET (5 min before market open).
-    Execute any trades queued by last night's signal check.
+    Two-phase execution:
+
+    Phase 1 (9:25 AM ET): Place simple market buys for all queued trades.
+      Orders queue pre-market and fill at/near the 9:30 AM ET open.
+
+    Phase 2 (~9:32 AM ET): Poll Alpaca for real fill prices, then place
+      OCO exits (stop + take-profit) based on the ACTUAL fill — not yesterday's
+      close estimate. This ensures stop/target distances are always correct
+      regardless of overnight gaps.
     """
     logger.info("=== Execute pending trades started ===")
 
@@ -75,8 +83,9 @@ async def job_execute_trades(bot):
         logger.error("Could not fetch account equity — aborting execution.")
         return
 
-    placed    = []
-    skipped   = []
+    # ── Phase 1: place all market buys ───────────────────────────────────────
+    pending_fills = []   # trades waiting for fill confirmation
+    skipped       = []
 
     for trade in pending:
         ticker      = trade["ticker"]
@@ -96,13 +105,11 @@ async def job_execute_trades(bot):
             await tbot.post_alert(bot, msg)
             break
 
-        # Per-ticker earnings check
         earn_safe, earn_date = trader.check_earnings(ticker)
         if not earn_safe:
             skipped.append(f"{ticker} (earnings {earn_date})")
             continue
 
-        # Position sizing — ATR-based to target $40/trade, hard-capped at 15%
         from signals import calculate_position_size
         qty = calculate_position_size(
             entry_price     = close_price,
@@ -119,33 +126,102 @@ async def job_execute_trades(bot):
             skipped.append(f"{ticker} (price too high for position cap)")
             continue
 
-        stop_price   = round(close_price - atr * config.ATR_STOP_MULTIPLIER,   2)
-        target_price = round(close_price + atr * config.ATR_TARGET_MULTIPLIER, 2)
-
-        order_id = trader.place_bracket_order(ticker, qty, stop_price, target_price)
-        if order_id:
+        # Place market buy (no stop/target yet — will be set after fill)
+        entry_order_id = trader.place_market_buy(ticker, qty)
+        if entry_order_id:
             tlog.log_order_placed(
                 ticker          = ticker,
                 signal_date     = signal_date,
                 entry_price_est = close_price,
-                stop_price      = stop_price,
-                target_price    = target_price,
+                stop_price      = None,   # set after fill
+                target_price    = None,   # set after fill
                 qty             = qty,
-                alpaca_order_id = order_id,
+                alpaca_order_id = entry_order_id,
             )
             tlog.remove_pending_trade(ticker)
-            placed.append({
-                "ticker":  ticker,
-                "qty":     qty,
-                "stop":    stop_price,
-                "target":  target_price,
+            pending_fills.append({
+                "ticker":   ticker,
+                "qty":      qty,
+                "order_id": entry_order_id,
+                "atr":      atr,
             })
             open_count += 1
         else:
             skipped.append(f"{ticker} (order failed)")
 
-    await tbot.post_execution_summary(bot, placed, skipped)
-    logger.info(f"=== Execute trades complete — {len(placed)} placed, {len(skipped)} skipped ===")
+    if not pending_fills:
+        await tbot.post_execution_summary(bot, [], skipped)
+        logger.info("=== Execute trades complete — 0 placed ===")
+        return
+
+    # ── Phase 2: wait for market open, poll fills, place OCO exits ───────────
+    # Orders placed pre-market fill at the 9:30 AM ET open.
+    # We wait 2 min after open (9:32 AM ET) then poll every 30s for up to 3 min.
+    logger.info(f"Waiting 2 min for market open to fill {len(pending_fills)} order(s)...")
+    await asyncio.sleep(2 * 60)
+
+    placed       = []
+    fill_errors  = []
+
+    for entry in pending_fills:
+        ticker = entry["ticker"]
+        atr    = entry["atr"]
+
+        # Poll for fill — 6 attempts × 30s = 3 min max wait per order
+        fill_price = None
+        for attempt in range(6):
+            fill_price = trader.get_order_fill_price(entry["order_id"])
+            if fill_price:
+                logger.info(f"{ticker} filled @ ${fill_price}")
+                break
+            if attempt < 5:
+                logger.info(f"{ticker}: not yet filled (attempt {attempt+1}/6) — waiting 30s...")
+                await asyncio.sleep(30)
+
+        if not fill_price:
+            # Order didn't fill — cancel it to avoid a surprise fill later
+            trader.cancel_order(entry["order_id"])
+            msg = (f"⚠️ {ticker}: market buy NOT filled within 3 min of open — "
+                   f"order cancelled. Check Alpaca manually.")
+            logger.warning(msg)
+            await tbot.post_alert(bot, msg)
+            fill_errors.append(f"{ticker} (fill timeout — cancelled)")
+            continue
+
+        # Calculate stop and target from the REAL fill price
+        stop_price   = round(fill_price - atr * config.ATR_STOP_MULTIPLIER,   2)
+        target_price = round(fill_price + atr * config.ATR_TARGET_MULTIPLIER, 2)
+
+        # Place OCO exit
+        oco_id = trader.place_oco_exit(ticker, entry["qty"], stop_price, target_price)
+        if oco_id:
+            tlog.update_trade_after_fill(
+                entry_order_id = entry["order_id"],
+                fill_price     = fill_price,
+                stop_price     = stop_price,
+                target_price   = target_price,
+                oco_order_id   = oco_id,
+            )
+            placed.append({
+                "ticker": ticker,
+                "qty":    entry["qty"],
+                "fill":   fill_price,
+                "stop":   stop_price,
+                "target": target_price,
+            })
+        else:
+            # Fill happened but OCO failed — position is open with NO protection!
+            msg = (f"🚨 {ticker}: filled @ ${fill_price} but OCO order FAILED — "
+                   f"position has no stop/target! Cancel manually in Alpaca.")
+            logger.error(msg)
+            await tbot.post_alert(bot, msg)
+            fill_errors.append(f"{ticker} (OCO failed — MANUAL ACTION NEEDED)")
+
+    await tbot.post_execution_summary(bot, placed, skipped + fill_errors)
+    logger.info(
+        f"=== Execute trades complete — {len(placed)} filled+OCO placed, "
+        f"{len(skipped)} skipped, {len(fill_errors)} errors ==="
+    )
 
 
 async def job_signal_check(bot):
@@ -202,23 +278,16 @@ async def job_weekly_report(bot):
 async def job_monitor_positions(bot):
     """
     Job 4 — every 15 min during market hours (4:30 PM – 11:00 PM Finnish).
-    1. Updates real entry fill price for any newly filled entries.
-    2. Checks for closed bracket legs (stop/target hit) and notifies.
+    Checks for closed OCO legs (stop/target hit) and sends Telegram notification.
+
+    Entry price and stop/target are already set accurately in job_execute_trades
+    Phase 2 (fill-based). The monitor only needs to watch for exit events.
     """
     open_trades = tlog.get_open_trades()
     if not open_trades:
         return
 
     tracked_ids = [t["alpaca_order_id"] for t in open_trades if t.get("alpaca_order_id")]
-
-    # ── Update real entry fill prices ────────────────────────────────────────
-    filled_entries = trader.get_filled_entries(tracked_ids)
-    for fe in filled_entries:
-        tlog.update_entry_price(
-            alpaca_order_id = fe["alpaca_order_id"],
-            entry_price     = fe["entry_price"],
-            entry_date      = fe["entry_date"],
-        )
 
     # ── Check for closed positions (stop or target hit) ───────────────────────
     closed = trader.get_closed_bracket_legs(tracked_ids)

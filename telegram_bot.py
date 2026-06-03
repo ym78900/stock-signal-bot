@@ -772,10 +772,11 @@ async def post_execution_summary(bot: Bot, placed: list, skipped: list) -> None:
         "",
     ]
     if placed:
-        lines.append(f"*Placed {len(placed)} bracket order(s):*")
+        lines.append(f"*Placed {len(placed)} order(s):*")
         for p in placed:
+            fill_str = f"  filled @ ${p['fill']}" if p.get('fill') else ""
             lines.append(
-                f"  *{p['ticker']}*  qty={p['qty']}  "
+                f"  *{p['ticker']}*  qty={p['qty']}{fill_str}  "
                 f"SL=${p['stop']}  TP=${p['target']}"
             )
     else:

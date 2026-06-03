@@ -312,7 +312,8 @@ def calculate_position_size(
     return shares
 
 
-def run_signal_check(watchlist: List[dict]) -> List[dict]:    """
+def run_signal_check(watchlist: List[dict]) -> List[dict]:
+    """
     Run signal analysis on all stocks in the watchlist.
     Fetches fresh daily data for each stock and returns a list of analysis dicts.
     Only returns stocks with a BUY or SELL signal.

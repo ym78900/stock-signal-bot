@@ -152,12 +152,17 @@ def log_order_placed(
     ticker: str,
     signal_date: str,
     entry_price_est: float,
-    stop_price: float,
-    target_price: float,
+    stop_price: Optional[float],
+    target_price: Optional[float],
     qty: int,
     alpaca_order_id: str,
 ) -> str:
-    """Record an order as placed (status=open). Returns trade_id."""
+    """
+    Record a market buy order as placed (status=open).
+    stop_price and target_price may be None at this stage — they are filled in
+    by update_trade_after_fill() once the real fill price is confirmed.
+    Returns trade_id.
+    """
     _ensure_csv()
     trade_id = str(uuid.uuid4())[:8]
     row = {
@@ -170,8 +175,8 @@ def log_order_placed(
         "exit_price":       "",
         "exit_reason":      "",
         "qty":              qty,
-        "stop_price":       stop_price,
-        "target_price":     target_price,
+        "stop_price":       stop_price if stop_price is not None else "",
+        "target_price":     target_price if target_price is not None else "",
         "gross_pnl":        "",
         "fees":             FEE_PER_SIDE * 2,
         "net_pnl":          "",
@@ -197,6 +202,46 @@ def update_entry_price(alpaca_order_id: str, entry_price: float, entry_date: str
                 row["entry_date"]  = entry_date
                 updated = True
                 logger.info(f"Entry fill updated: {row['ticker']} @ ${entry_price}")
+            break
+    if updated:
+        _write_all(rows)
+    return updated
+
+
+def update_trade_after_fill(
+    entry_order_id: str,
+    fill_price: float,
+    stop_price: float,
+    target_price: float,
+    oco_order_id: str,
+) -> bool:
+    """
+    Called after the market buy fills and the OCO exit is placed.
+
+    Updates the trade row with:
+      - Real fill price (replaces close_price estimate)
+      - Real stop/target (calculated from fill price, not prior close)
+      - OCO order ID (replaces entry order ID so the monitor tracks the exit)
+
+    The monitor's get_closed_bracket_legs() will then watch the OCO order
+    and detect when the stop or target is hit.
+
+    Returns True if a row was updated.
+    """
+    rows    = _read_all()
+    updated = False
+    for row in rows:
+        if row["alpaca_order_id"] == entry_order_id and row["status"] == "open":
+            row["entry_price"]     = fill_price
+            row["entry_date"]      = str(date.today())
+            row["stop_price"]      = stop_price
+            row["target_price"]    = target_price
+            row["alpaca_order_id"] = oco_order_id   # switch to OCO id for exit tracking
+            updated = True
+            logger.info(
+                f"Trade updated after fill: {row['ticker']} "
+                f"fill=${fill_price} SL=${stop_price} TP=${target_price}"
+            )
             break
     if updated:
         _write_all(rows)
