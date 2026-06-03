@@ -40,8 +40,13 @@ DATA_INTERVAL = "1d"       # Daily candles
 #                              none beat baseline; baseline kept
 # Round 4 (price cap + sizing): $5–$150 hard cap adopted; ATR-target $40 sizing rejected
 # Round 5 (universe size):    S&P 500-only confirmed best; NASDAQ-100 and full market rejected
-# Round 6 (price cap raise):  $250 cap confirmed best: 100 trades, 74.0% win, PF 3.22, +$4,302
-#                              vs $150 baseline: 78 trades, 71.8% win, PF 2.83, +$2,713
+# Round 6 (price cap raise):  BUGGED (consecutive-loss sim only measured first 100 trades)
+# Round 7 (full-window fix):  Fixed consecutive-loss bug — auto-resume after 7 calendar days.
+#                              $200 cap confirmed best: 506 trades, 58.5% win, PF 1.93, +$25,041
+#                              Trailing stop 3.5x ATR also beats fixed target: +$31,712, DD 15.2%
+#
+# Backtester note: open_tickers set is never populated (known limitation — no concurrent tracking).
+#                  Both simulations affected equally so comparisons remain valid.
 #
 # Final performance (Round 6): +86.0% over 2 years, 74.0% win rate, -4.0% max DD, PF 3.22
 RSI_BUY_THRESHOLD  = 38    # RSI below this → BUY signal
@@ -105,10 +110,11 @@ VOLUME_AVG_DAYS = 20
 
 # ── Price Filters ─────────────────────────────────────────────────────────────
 PRICE_MIN           = 5.0    # Hard skip: stocks below $5 (too illiquid)
-PRICE_MAX_HARD      = 250.0  # Hard skip: stocks above $250 — confirmed best in Round 6
-                             # price cap backtest ($150 vs $200 vs $250 vs no cap).
-                             # $250 = 100 trades, 74.0% win, PF 3.22 — best profit factor.
-                             # Natural floor: 12% of $5k = $600 ÷ 3 shares min = $200 natural cap.
+PRICE_MAX_HARD      = 200.0  # Hard skip: stocks above $200 — confirmed best in Round 7
+                             # Full 2-year backtest (fixed consecutive-loss bug):
+                             # $200 = 506 trades, 58.5% win, PF 1.93, +$25,041, DD 19.2%  ← BEST
+                             # $250 = 555 trades, 57.7% win, PF 1.79, +$22,983, DD 24.2%  (worse)
+                             # Natural floor: 12% of $5k = $600 ÷ 3 shares min = $200 anyway.
 PRICE_MAX_PREFERRED = 50.0   # Soft scoring bonus for stocks in the $5–$50 range
 MIN_AVG_VOLUME      = 200_000  # Hard skip: under 200K avg daily volume = illiquid
 

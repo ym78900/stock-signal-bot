@@ -494,14 +494,45 @@ def simulate_fast(
     portfolio          = STARTING_CAPITAL
     open_tickers       = set()
     consecutive_losses = 0
+    paused_until_date  = None   # date after which trading resumes (simulates /resume)
 
     for row in enriched_rows:
         ticker = row["ticker"]
 
         if ticker in open_tickers:
             continue
+
+        # ── Consecutive-loss pause (simulates /pause + auto-resume after 5 trading days) ──
+        # In live trading the user manually runs /resume. In backtesting we auto-resume
+        # after CONSEC_LOSS_PAUSE_DAYS trading days so the full 2-year window is measured.
         if consecutive_losses >= consec_loss_limit:
-            continue
+            if paused_until_date is None:
+                # Set resume date = current signal date + 5 calendar days
+                import datetime as _dt
+                raw = row["date"]
+                if hasattr(raw, "date"):
+                    base = raw.date()
+                else:
+                    try:
+                        base = _dt.date.fromisoformat(str(raw)[:10])
+                    except Exception:
+                        base = _dt.date.today()
+                paused_until_date = base + _dt.timedelta(days=7)  # ~5 trading days
+            # Compare current row date to resume date
+            raw = row["date"]
+            if hasattr(raw, "date"):
+                cur = raw.date()
+            else:
+                try:
+                    cur = _dt.date.fromisoformat(str(raw)[:10])
+                except Exception:
+                    cur = paused_until_date  # fallback: stay paused
+            if cur <= paused_until_date:
+                continue
+            else:
+                consecutive_losses = 0
+                paused_until_date  = None
+
         if len(open_tickers) >= max_open_pos:
             continue
 
