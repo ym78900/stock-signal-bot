@@ -48,6 +48,70 @@ def get_company_name(ticker: str) -> str:
 
 
 _nasdaq100_cache: Optional[List[str]] = None
+_full_market_cache: Optional[List[str]] = None
+
+# GitHub source for full NYSE + NASDAQ listings (rreichel3/US-Stock-Symbols)
+_NYSE_TICKERS_URL    = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nyse/nyse_full_tickers.json"
+_NASDAQ_TICKERS_URL  = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full_tickers.json"
+
+
+def get_full_market_tickers() -> List[str]:
+    """
+    Fetch all NYSE + NASDAQ equity tickers from a public GitHub source.
+    Returns ~6,500–7,000 raw tickers. Price/volume filters in the backtester
+    will narrow this down to ~1,500–2,500 tradeable quality stocks.
+    Cached in memory for the session.
+    """
+    global _full_market_cache
+    if _full_market_cache is not None:
+        return _full_market_cache
+
+    logger.info("Fetching full NYSE + NASDAQ ticker lists from GitHub...")
+    try:
+        import requests
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; stock-signal-bot/1.0)"}
+
+        nyse_resp   = requests.get(_NYSE_TICKERS_URL,   headers=headers, timeout=15)
+        nasdaq_resp = requests.get(_NASDAQ_TICKERS_URL, headers=headers, timeout=15)
+        nyse_resp.raise_for_status()
+        nasdaq_resp.raise_for_status()
+
+        nyse_raw   = nyse_resp.json()    # list of ticker strings
+        nasdaq_raw = nasdaq_resp.json()  # list of ticker strings
+
+        # Normalise: each item may be a str or a dict with a "symbol" key
+        def _extract(item):
+            if isinstance(item, str):
+                return item
+            if isinstance(item, dict):
+                return item.get("symbol") or item.get("ticker") or ""
+            return ""
+
+        raw = [_extract(t) for lst in (nyse_raw, nasdaq_raw) for t in lst]
+
+        # Basic cleanup: skip ETFs, warrants, rights, preferred shares
+        # Keep only tickers that are 1–5 uppercase letters (with optional dash for share class)
+        import re
+        pattern = re.compile(r'^[A-Z]{1,5}(-[A-Z])?$')
+        tickers = [t.replace(".", "-") for t in raw
+                   if isinstance(t, str) and pattern.match(t.replace(".", "-"))]
+
+        # Deduplicate preserving order
+        seen = set()
+        deduped = []
+        for t in tickers:
+            if t not in seen:
+                seen.add(t)
+                deduped.append(t)
+
+        _full_market_cache = deduped
+        logger.info(f"Full market universe: {len(deduped)} tickers "
+                    f"(NYSE + NASDAQ, after basic symbol cleanup).")
+        return deduped
+
+    except Exception as e:
+        logger.error(f"Failed to fetch full market ticker list: {e}")
+        return []
 
 
 def get_nasdaq100_tickers() -> List[str]:

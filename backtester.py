@@ -38,7 +38,7 @@ import ta as ta_lib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from scanner import get_sp500_tickers, get_extended_tickers
+from scanner import get_sp500_tickers, get_extended_tickers, get_full_market_tickers
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,12 +75,19 @@ EXTENDED_CACHE_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file_
 EXTENDED_INDICATORS_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_indicators_extended.pkl")
 EXTENDED_EXITS_CACHE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_exits_extended.pkl")
 
+# Full market universe (NYSE + NASDAQ, ~6,500 raw → ~2,000 after price/vol filter)
+FULL_MARKET_CACHE_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache_full_market.pkl")
+FULL_MARKET_INDICATORS_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_indicators_full_market.pkl")
+FULL_MARKET_EXITS_CACHE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_exits_full_market.pkl")
+
 
 # ── Step 1: Download & cache raw price data ────────────────────────────────────
 
-def load_or_download_data(tickers: List[str], cache_file: str = None) -> Dict[str, pd.DataFrame]:
+def load_or_download_data(tickers: List[str], cache_file: str = None,
+                          batch_size: int = 500) -> Dict[str, pd.DataFrame]:
     """
     Load price data from cache, downloading only missing tickers if cache exists.
+    Downloads in batches of batch_size to avoid OS thread-limit errors on large universes.
     Pass cache_file to use an alternate cache (e.g. for extended universe).
     """
     if cache_file is None:
@@ -100,39 +107,48 @@ def load_or_download_data(tickers: List[str], cache_file: str = None) -> Dict[st
 
     end_date   = datetime.today()
     start_date = end_date - timedelta(days=BACKTEST_YEARS * 365 + 300)
+    min_rows   = MA_200 + ATR_PERIOD + 10
+    newly_added = 0
 
-    logger.info(f"Downloading {len(missing)} new tickers "
+    # Download in batches to avoid hitting OS thread limits on large universes
+    batches = [missing[i:i + batch_size] for i in range(0, len(missing), batch_size)]
+    logger.info(f"Downloading {len(missing)} new tickers in {len(batches)} batches "
                 f"({start_date.date()} → {end_date.date()})...")
 
-    raw = yf.download(
-        tickers=missing,
-        start=start_date.strftime("%Y-%m-%d"),
-        end=end_date.strftime("%Y-%m-%d"),
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
-
-    min_rows = MA_200 + ATR_PERIOD + 10
-    newly_added = 0
-    for ticker in missing:
+    for batch_num, batch in enumerate(batches, 1):
+        logger.info(f"  Batch {batch_num}/{len(batches)}: {len(batch)} tickers...")
         try:
-            df = raw[ticker].copy() if len(missing) > 1 else raw.copy()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df.dropna(subset=["Close"], inplace=True)
-            if len(df) >= min_rows:
-                existing[ticker] = df
-                newly_added += 1
-        except Exception:
+            raw = yf.download(
+                tickers=batch,
+                start=start_date.strftime("%Y-%m-%d"),
+                end=end_date.strftime("%Y-%m-%d"),
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+        except Exception as e:
+            logger.warning(f"  Batch {batch_num} download error: {e} — skipping batch")
             continue
 
-    logger.info(f"Added {newly_added} new tickers. Total cache size: {len(existing)}. Saving...")
-    with open(cache_file, "wb") as f:
-        pickle.dump(existing, f)
+        for ticker in batch:
+            try:
+                df = raw[ticker].copy() if len(batch) > 1 else raw.copy()
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.dropna(subset=["Close"], inplace=True)
+                if len(df) >= min_rows:
+                    existing[ticker] = df
+                    newly_added += 1
+            except Exception:
+                continue
 
+        # Save progress after each batch so a crash doesn't lose everything
+        with open(cache_file, "wb") as f:
+            pickle.dump(existing, f)
+
+    logger.info(f"Added {newly_added} new tickers. Total cache size: {len(existing)}.")
     return existing
 
 
@@ -1832,27 +1848,54 @@ NOTE — Earnings filter (Phase 3d):
             )
             print_report(s_5b, f"5B: S&P 500 + NASDAQ-100 (~{len(ext_data)} tickers, 12% fixed)")
 
+            # 5C: Full market (NYSE + NASDAQ, ~6,500 raw → filtered by price/vol in simulator)
+            print("\n" + "=" * 68)
+            print("  PART C — Full Market (NYSE + NASDAQ, ~6,500 raw tickers)")
+            print("  Downloading missing tickers — this may take 15–30 min first run.")
+            print("=" * 68)
+            full_tickers = get_full_market_tickers()
+            print(f"  Raw tickers fetched: {len(full_tickers)}")
+            full_data = load_or_download_data(full_tickers, cache_file=FULL_MARKET_CACHE_FILE)
+            print(f"  Tickers with 2yr+ data: {len(full_data)}")
+            full_rows, full_processed = precompute_signals(full_data, indicators_cache=FULL_MARKET_INDICATORS_CACHE)
+            print(f"  Signal candidates: {len(full_rows)}")
+            full_enriched = precompute_exits(full_rows, full_processed, atr_stops, atr_targets,
+                                             exits_cache=FULL_MARKET_EXITS_CACHE)
+            print(f"  Enriched rows: {len(full_enriched)}\n")
+
+            _, s_5c = simulate_fast(
+                full_enriched, R5_RSI_BUY, R5_RSI_SELL, R5_ATR_STOP, R5_ATR_TARGET,
+                max_position_pct=0.12, max_open_pos=5,
+                sizing_mode="fixed_pct",
+                **r5_filters,
+            )
+            print_report(s_5c, f"5C: Full market (~{len(full_data)} tickers, 12% fixed)")
+
             round5_results = [
                 {"label": f"5A: S&P 500 only ({len(data)} tickers)", "summary": s_5a},
-                {"label": f"5B: Extended universe (~{len(ext_data)} tickers)", "summary": s_5b},
+                {"label": f"5B: S&P 500 + NASDAQ-100 ({len(ext_data)} tickers)", "summary": s_5b},
+                {"label": f"5C: Full NYSE + NASDAQ ({len(full_data)} tickers)", "summary": s_5c},
             ]
-            print_comparison(round5_results, title="ROUND 5 SUMMARY — S&P 500 vs Extended Universe")
+            print_comparison(round5_results, title="ROUND 5 SUMMARY — Universe Size Comparison")
 
-            if s_5a and s_5b:
-                delta_trades = (s_5b["total_trades"] - s_5a["total_trades"])
-                delta_pnl    = (s_5b["total_net_pnl"] - s_5a["total_net_pnl"])
-                delta_wr     = (s_5b["win_rate_pct"]  - s_5a["win_rate_pct"])
-                print(f"\n  NASDAQ-100 expansion impact:")
-                print(f"    Trade count: {'+' if delta_trades >= 0 else ''}{delta_trades} trades")
-                print(f"    Total P&L:   {'▲ +' if delta_pnl >= 0 else '▼ '}${abs(delta_pnl):,.2f}")
-                print(f"    Win rate:    {'+' if delta_wr >= 0 else ''}{delta_wr:.1f}%")
-                verdict = (
-                    "✅ ADOPT — extended universe meaningfully improves both P&L and win rate."
-                    if delta_pnl > 50 and delta_wr >= 0
-                    else "⚠️  NEUTRAL — marginal or mixed improvement, not worth the added complexity."
-                    if delta_pnl > 0
-                    else "❌ SKIP — extended universe reduces P&L and/or win rate vs S&P 500 only."
-                )
-                print(f"\n  VERDICT: {verdict}")
+            # Per-scenario verdict vs S&P 500 baseline
+            if s_5a:
+                base_pnl = s_5a["total_net_pnl"]
+                print(f"\n  Impact vs S&P 500 baseline (5A):")
+                for label, s in [("5B (NASDAQ-100 add)", s_5b), ("5C (Full market)", s_5c)]:
+                    if s:
+                        dp = s["total_net_pnl"] - base_pnl
+                        dt = s["total_trades"] - s_5a["total_trades"]
+                        dw = s["win_rate_pct"]  - s_5a["win_rate_pct"]
+                        verdict = (
+                            "✅ ADOPT"
+                            if dp > 50 and dw >= -1.0
+                            else "⚠️  NEUTRAL"
+                            if dp > 0
+                            else "❌ SKIP"
+                        )
+                        print(f"    {label}: trades {'+' if dt>=0 else ''}{dt}  "
+                              f"P&L {'▲' if dp>=0 else '▼'} ${abs(dp):,.0f}  "
+                              f"win rate {dw:+.1f}%  → {verdict}")
 
     print("\nRound 5 complete.")

@@ -32,7 +32,7 @@ A fully automated Python swing trading bot that:
 |---|---|---|
 | RSI timeframe | Daily candles only (`interval="1d"`) | Reliable, matches swing hold periods |
 | Signal timing | Post-close only (11:15 PM Finnish) | New daily candles finalize at market close |
-| Universe | S&P 500 + NASDAQ-100 (~600 tickers) | NASDAQ-100 adds key $5–$50 volatile stocks |
+| Universe | S&P 500 only (~503 tickers) | Round 5 backtest: NASDAQ-100 adds 13 tickers and reduces P&L; full NYSE+NASDAQ produces 18 trades vs 78 — filters reject most small-caps |
 | Price filter | Hard skip below $5 or above $150 | Prevents 1-share position blowups (AZO bug) |
 | Position sizing | ATR-based `calculate_position_size()` targeting $40/trade, 15% hard cap | Replaces broken `max(1, int(...))` formula |
 | Min shares | 3 shares minimum | Skip trade if can't buy ≥3 within position cap |
@@ -148,14 +148,22 @@ EXTENDED_UNIVERSE_ENABLED = True    # S&P 500 + NASDAQ-100
 | Round 2 | SPY MA + VIX filters | No effect in bull window — kept as live safety nets |
 | Round 3 | BB bands, 200MA slope, max hold caps | None beat baseline — baseline locked |
 | Round 4 | ATR-target sizing, price cap $5–$150 | Baseline still best total profit; price cap fixes AZO bug |
-| Round 5 | Extended universe: S&P 500 + NASDAQ-100 | NASDAQ-100 adds only 13 new tickers (rest overlap); P&L ▼$238, win rate ▼2.2% — not adopted |
+| Round 5 | Universe size: S&P 500 vs +NASDAQ-100 vs full NYSE+NASDAQ (5,177 tickers) | S&P 500 wins decisively. Full market: only 18 trades, P&L ▼$2,144 vs baseline. NASDAQ-100 adds nothing. S&P 500-only confirmed. |
 
 **Confirmed best (baseline):**
 - Return: +131.6% | Win rate: 74.3% | Profit factor: 3.23 | Max drawdown: -3.4% | 136 trades
 
 **Round 4 key finding:** ATR-target $40/trade sizing reduces per-trade variance (avg win $37, avg loss $27, DD -1.3%) but also reduces 2-year total P&L by ~70%. Price cap alone ($5–$150) is the correct fix — adopted for live. ATR-target sizing not adopted.
 
-**Round 5 key finding:** NASDAQ-100 adds only 13 unique tickers beyond S&P 500 (most NASDAQ-100 stocks are already in S&P 500). Extended universe (515 tickers) vs S&P 500 (502): trades +1, P&L ▼$238, win rate ▼2.2%, PF 2.47 vs 2.83. S&P 500-only universe is better for this strategy. `EXTENDED_UNIVERSE_ENABLED` left as True in config (no harm — nearly identical universe in practice) but the bot effectively scans ~503 tickers.
+**Round 5 key finding (three-way universe comparison):**
+
+| Universe | Tickers | Trades | Win% | P&L | PF | Verdict |
+|---|---|---|---|---|---|---|
+| S&P 500 only | 502 | 78 | 71.8% | +$2,713 | 2.83 | ✅ BASELINE |
+| S&P 500 + NASDAQ-100 | 515 | 79 | 69.6% | +$2,475 | 2.47 | ❌ SKIP |
+| Full NYSE + NASDAQ | 5,177 | 18 | 61.1% | +$569 | 3.31 | ❌ SKIP |
+
+The 5× wider universe produces only 18 trades (vs 78) — the RSI+MA+volume+price filters aggressively reject most small-cap stocks, starving the engine of signals. S&P 500-only universe confirmed as best. `EXTENDED_UNIVERSE_ENABLED` set to False in the key decisions table — the NASDAQ-100 expansion adds 13 new tickers and reduces P&L.
 
 ---
 
