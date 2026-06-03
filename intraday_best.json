@@ -1,0 +1,14 @@
+{
+  "rsi_buy": 28,
+  "atr_stop": 2.0,
+  "atr_target": 4.0,
+  "volume_ratio": 1.5,
+  "above_vwap": true,
+  "below_vwap": false,
+  "trades": 55,
+  "win_rate": 54.5,
+  "net_pnl": -15.69,
+  "return_pct": -0.31,
+  "max_dd": 0.45,
+  "profit_factor": 0.87
+}

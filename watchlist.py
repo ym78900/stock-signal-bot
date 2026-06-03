@@ -70,6 +70,9 @@ def get_watchlist_with_names() -> List[dict]:
         if "company_name" not in s:
             s["company_name"] = s["ticker"]
     return stocks
+
+
+def mark_signal_fired(ticker: str) -> None:
     """Record that a signal has already been sent for this ticker today."""
     state = _load()
     if ticker not in state["fired_signals"]:

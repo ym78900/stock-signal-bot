@@ -1,4 +1,7 @@
 import logging
+import pickle
+from datetime import date
+from pathlib import Path
 from typing import Optional, List, Dict
 import pandas as pd
 import yfinance as yf
@@ -7,6 +10,31 @@ import ta as ta_lib
 import config
 
 logger = logging.getLogger(__name__)
+
+# ── Daily data cache (reused within the same calendar day) ───────────────────
+
+_DAILY_CACHE_FILE = Path(__file__).parent / "daily_data_cache.pkl"
+
+def _load_daily_cache() -> Optional[Dict[str, pd.DataFrame]]:
+    """Return today's cached data if it exists, else None."""
+    try:
+        if _DAILY_CACHE_FILE.exists():
+            with open(_DAILY_CACHE_FILE, "rb") as f:
+                cached_date, data = pickle.load(f)
+            if cached_date == date.today():
+                logger.info(f"Daily cache hit — {len(data)} tickers loaded from disk.")
+                return data
+    except Exception as e:
+        logger.warning(f"Could not read daily cache: {e}")
+    return None
+
+def _save_daily_cache(data: Dict[str, pd.DataFrame]) -> None:
+    try:
+        with open(_DAILY_CACHE_FILE, "wb") as f:
+            pickle.dump((date.today(), data), f)
+        logger.info(f"Daily cache saved — {len(data)} tickers.")
+    except Exception as e:
+        logger.warning(f"Could not save daily cache: {e}")
 
 # ── S&P 500 ticker list ───────────────────────────────────────────────────────
 
@@ -57,9 +85,15 @@ def get_sp500_tickers() -> List[str]:
 def fetch_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
     """
     Download daily OHLCV data for all tickers in one bulk request.
+    Results are cached to disk for the current calendar day — subsequent
+    calls (e.g. /testrun) reuse the cache instead of re-downloading.
     Returns a dict: { "AAPL": DataFrame, "MSFT": DataFrame, ... }
     Only includes tickers that have sufficient data.
     """
+    cached = _load_daily_cache()
+    if cached is not None:
+        return cached
+
     logger.info(f"Downloading daily data for {len(tickers)} tickers...")
     try:
         raw = yf.download(
@@ -96,6 +130,7 @@ def fetch_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
             pass
 
     logger.info(f"Usable data for {len(result)} tickers.")
+    _save_daily_cache(result)
     return result
 
 
@@ -201,3 +236,81 @@ def run_morning_scan() -> List[dict]:
     top = scores[:config.TOP_N_STOCKS]
     logger.info(f"Top {len(top)} stocks: {[s['ticker'] for s in top]}")
     return top
+
+
+# ── Auto-trading scan (all 503 tickers, used at 11:15 PM) ────────────────────
+
+def run_auto_scan() -> list:
+    """
+    Scan ALL S&P 500 stocks for BUY signals using the confirmed swing parameters:
+      - RSI < RSI_BUY_THRESHOLD (38)
+      - Volume > VOLUME_CONFIRMATION_RATIO × 20-day avg (1.2×)
+      - ATR computed for position sizing
+
+    Called from job_signal_check at 11:15 PM Finnish after market close.
+    Returns list of signal dicts — one per qualifying stock.
+    """
+    import ta as ta_lib
+
+    tickers = get_sp500_tickers()
+    if not tickers:
+        logger.error("Auto-scan: no tickers available.")
+        return []
+
+    logger.info(f"Auto-scan: downloading data for {len(tickers)} tickers...")
+    data = fetch_data(tickers)
+    if not data:
+        logger.error("Auto-scan: no data returned.")
+        return []
+
+    signals = []
+    for ticker, df in data.items():
+        try:
+            # ── RSI ───────────────────────────────────────────────────────────
+            rsi_series = ta_lib.momentum.RSIIndicator(
+                df["Close"], window=config.RSI_PERIOD
+            ).rsi().dropna()
+            if rsi_series.empty:
+                continue
+            rsi = float(rsi_series.iloc[-1])
+            if rsi >= config.RSI_BUY_THRESHOLD:
+                continue   # not oversold
+
+            # ── Volume confirmation ───────────────────────────────────────────
+            vol_avg = df["Volume"].iloc[-config.VOLUME_AVG_DAYS:].mean()
+            if vol_avg == 0:
+                continue
+            vol_ratio = float(df["Volume"].iloc[-1]) / vol_avg
+            if vol_ratio < config.VOLUME_CONFIRMATION_RATIO:
+                continue   # low volume — skip
+
+            # ── ATR ───────────────────────────────────────────────────────────
+            atr_series = ta_lib.volatility.AverageTrueRange(
+                df["High"], df["Low"], df["Close"], window=config.ATR_PERIOD
+            ).average_true_range().dropna()
+            if atr_series.empty:
+                continue
+            atr = float(atr_series.iloc[-1])
+            if atr <= 0:
+                continue
+
+            close_price = float(df["Close"].iloc[-1])
+            signal_date = df.index[-1].date()
+
+            signals.append({
+                "ticker":       ticker,
+                "signal_date":  signal_date,
+                "close_price":  round(close_price, 4),
+                "rsi":          round(rsi, 1),
+                "atr":          round(atr, 4),
+                "volume_ratio": round(vol_ratio, 2),
+                "stop_est":     round(close_price - atr * config.ATR_STOP_MULTIPLIER, 2),
+                "target_est":   round(close_price + atr * config.ATR_TARGET_MULTIPLIER, 2),
+            })
+
+        except Exception as e:
+            logger.debug(f"Auto-scan: error on {ticker}: {e}")
+            continue
+
+    logger.info(f"Auto-scan complete: {len(signals)} BUY signal(s) found.")
+    return signals

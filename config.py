@@ -11,6 +11,13 @@ MORNING_SCAN_MINUTE = 0
 WATCHLIST_POST_HOUR   = 16  # 4:20 PM Finnish = 9:20 AM ET
 WATCHLIST_POST_MINUTE = 20
 
+# Execute queued trades — 9:25 AM ET, 5 min before market open
+EXECUTE_TRADES_HOUR   = 16  # 4:25 PM Finnish = 9:25 AM ET
+EXECUTE_TRADES_MINUTE = 25
+
+# Monitor open positions every N minutes (during market hours)
+MONITOR_INTERVAL_MINUTES = 15
+
 SIGNAL_CHECK_HOUR   = 23   # 11:15 PM Finnish = 4:15 PM ET (post-close)
 SIGNAL_CHECK_MINUTE = 15
 
@@ -19,24 +26,76 @@ SP500_WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies
 TOP_N_STOCKS = 50          # How many stocks to put on the daily watchlist
 
 # ── yfinance fetch settings ───────────────────────────────────────────────────
-DATA_PERIOD   = "60d"      # 60 days of history (enough for 50-day MA)
+DATA_PERIOD   = "60d"      # 60 days of history (enough for 50-day MA + ATR)
 DATA_INTERVAL = "1d"       # Daily candles
 
 # ── Signal thresholds ─────────────────────────────────────────────────────────
-RSI_BUY_THRESHOLD  = 30    # RSI below this → BUY signal
-RSI_SELL_THRESHOLD = 70    # RSI above this → SELL signal
+# Final confirmed values from 3-round backtesting framework (May 2026).
+# Tested on 503 S&P 500 stocks, 2-year window (May 2024–May 2026), $5,000 capital.
+#
+# Round 1 (portfolio params): 900 combos → 12% pos size best PF (3.23)
+# Round 2 (bear protection):  SPY 50/100/200MA + VIX filters → no effect in bull window
+#                              Kept as live-only safety nets
+# Round 3 (new indicators):   BB lower band, 200MA slope, max hold days →
+#                              none beat baseline; 200MA slope raises PF (3.50) but costs $1,488
+#                              → baseline kept (more total profit)
+#
+# Final performance: +131.6% over 2 years, 74.3% win rate, -3.4% max DD, PF 3.23
+RSI_BUY_THRESHOLD  = 38    # RSI below this → BUY signal
+RSI_SELL_THRESHOLD = 55    # RSI above this → informational only (exits handled by ATR bracket)
 RSI_PERIOD         = 14    # Standard RSI period
 
+# ── ATR-based exit multipliers ────────────────────────────────────────────────
+# ×3.5/×6.0 confirmed best across all rounds (wider stop lets trades breathe,
+# wider target captures full swing move)
+ATR_PERIOD            = 14    # ATR lookback period
+ATR_STOP_MULTIPLIER   = 3.5   # Stop loss   = entry − (ATR × 3.5)
+ATR_TARGET_MULTIPLIER = 6.0   # Take profit = entry + (ATR × 6.0)
+
+# ── Confirmation filters ──────────────────────────────────────────────────────
+# Volume: only trade if today's volume > this × 20-day avg.
+# 1.2× confirmed as best threshold — tighter cuts winners, looser loses quality.
+VOLUME_CONFIRMATION_RATIO = 1.2
+
+# SPY trend filter: only take BUY signals when SPY is above its 50-day MA.
+# Had zero effect in 2-year backtest (pure bull market) — kept as live safety net.
+USE_SPY_TREND_FILTER = True
+
+# VIX filter: skip all trading when VIX ≥ threshold (high fear / volatility spike).
+# Threshold: 25 (blocks March 2020 / April 2025 style selloffs)
+USE_VIX_FILTER  = True
+VIX_MAX         = 25
+
+# MACD filter: permanently dropped — incompatible with oversold RSI mean-reversion.
+USE_MACD_CONFIRMATION = False
+
+# Earnings filter: skip if earnings within N days of signal.
+EARNINGS_BUFFER_DAYS = 3
+USE_EARNINGS_FILTER  = True
+
+# ── Moving averages (for signal display / watchlist ranking) ──────────────────
 MA_FAST = 20               # Fast moving average (days)
 MA_SLOW = 50               # Slow moving average (days)
 
-# ── Scoring weights (must add up to 1.0) ─────────────────────────────────────
-WEIGHT_VOLUME   = 0.35     # Volume vs 20-day average
-WEIGHT_RSI      = 0.40     # How close RSI is to buy/sell zone
-WEIGHT_MOMENTUM = 0.25     # 5-day price momentum
+# ── Portfolio / position sizing ───────────────────────────────────────────────
+# Confirmed best in Round 1 grid search (900 combinations, 2-year backtest):
+#  12% → +131.6% return, PF 3.23, DD -3.4%  ← BEST
+MAX_POSITION_PCT        = 0.12   # 12% of account equity per trade
+MAX_OPEN_POSITIONS      = 5      # Circuit breaker — skip new signals if N already open
+CONSECUTIVE_LOSS_LIMIT  = 3      # Pause auto-trading after N consecutive losses
+                                  # (unlimited → -82.7% DD; limit=2 too conservative)
+
+# ── Trading mode ─────────────────────────────────────────────────────────────
+TRADING_MODE  = "automatic"   # "automatic" or "manual"
+PAPER_TRADING = True          # True = Alpaca paper, False = live
+
+# ── Scoring weights (morning scan ranking — must add up to 1.0) ──────────────
+WEIGHT_VOLUME   = 0.35
+WEIGHT_RSI      = 0.40
+WEIGHT_MOMENTUM = 0.25
 
 # ── Momentum lookback ─────────────────────────────────────────────────────────
-MOMENTUM_DAYS = 5          # % price change over last N days — change this to adjust momentum window
+MOMENTUM_DAYS = 5
 
 # ── Volume baseline ───────────────────────────────────────────────────────────
-VOLUME_AVG_DAYS = 20       # Average volume over last N days
+VOLUME_AVG_DAYS = 20

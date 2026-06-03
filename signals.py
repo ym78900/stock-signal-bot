@@ -76,27 +76,38 @@ def get_company_name(ticker: str) -> Optional[str]:
         return None
 
 
-def fetch_realtime_price(ticker: str) -> Optional[float]:
-    """Fetch real-time price from Alpaca. Returns None if unavailable."""
+def fetch_realtime_price(ticker: str) -> tuple:
+    """
+    Fetch price via Alpaca (free tier, 15-min delayed).
+    Falls back to IBKR only if Alpaca is unavailable.
+    Returns (price, source) where source is 'ibkr', 'alpaca', or None.
+    """
+    # ── Alpaca first (avoids 10s IBKR timeout when IB Gateway is not running) ─
     try:
         from alpaca.data import StockHistoricalDataClient
         from alpaca.data.requests import StockLatestTradeRequest
 
         api_key    = os.environ.get("ALPACA_API_KEY")
         secret_key = os.environ.get("ALPACA_SECRET_KEY")
-        if not api_key or not secret_key:
-            return None
-
-        client  = StockHistoricalDataClient(api_key, secret_key)
-        request = StockLatestTradeRequest(symbol_or_symbols=ticker)
-        trade   = client.get_stock_latest_trade(request)
-
-        if ticker in trade:
-            return round(float(trade[ticker].price), 2)
-        return None
+        if api_key and secret_key:
+            client  = StockHistoricalDataClient(api_key, secret_key)
+            request = StockLatestTradeRequest(symbol_or_symbols=ticker)
+            trade   = client.get_stock_latest_trade(request)
+            if ticker in trade:
+                return (round(float(trade[ticker].price), 2), "alpaca")
     except Exception as e:
-        logger.warning(f"Alpaca real-time price fetch failed for {ticker}: {e}")
-        return None
+        logger.warning(f"Alpaca price fetch failed for {ticker}: {e}")
+
+    # ── IBKR fallback (only if Alpaca failed) ─────────────────────────────────
+    try:
+        import ibkr as ibkr_module
+        price = ibkr_module.get_price(ticker)
+        if price:
+            return (price, "ibkr")
+    except Exception:
+        pass
+
+    return (None, None)
 
 
 def fetch_ticker_data(ticker: str) -> Optional[pd.DataFrame]:
@@ -161,9 +172,10 @@ def analyse(ticker: str, df: pd.DataFrame, company_name: Optional[str] = None) -
     try:
         # ── Price + last candle date ──────────────────────────────────────────
         eod_price = round(float(df["Close"].iloc[-1]), 2)
-        realtime_price = fetch_realtime_price(ticker)
-        result["price"] = realtime_price if realtime_price else eod_price
-        result["realtime"] = realtime_price is not None
+        realtime_price, price_source = fetch_realtime_price(ticker)
+        result["price"]        = realtime_price if realtime_price else eod_price
+        result["price_source"] = price_source  # 'ibkr', 'alpaca', or None
+        result["realtime"]     = realtime_price is not None
         result["last_candle"] = str(df.index[-1].date())
 
         # ── RSI ───────────────────────────────────────────────────────────────

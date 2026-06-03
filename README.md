@@ -1,119 +1,105 @@
 # Stock Signal Bot
 
-A personal trading assistant that runs on my computer and sends stock alerts to a private Telegram channel — automatically, every day.
+A fully automated swing trading bot that scans the S&P 500 every day, generates BUY signals, and places bracket orders (entry + stop loss + take profit) automatically on Alpaca paper trading.
 
 ---
 
 ## What it does
 
-Every trading day it scans all **500 of the largest US companies** (the S&P 500 — think Apple, Tesla, NVIDIA, Microsoft...) and finds the ones most likely to make a significant move.
+Every trading day it:
 
-It then watches those stocks and sends me a message on Telegram when a BUY or SELL signal fires.
-
----
-
-## How it works, step by step
-
-**Step 1 — Before market opens (4:20 PM Finnish time)**
-
-The bot scores all 500 stocks and picks the top 10 most interesting ones for the day.
-
-It scores each stock on:
-- Is trading volume unusually high today? (people are paying attention)
-- Is the RSI near an extreme? (stock may be oversold or overbought)
-- Has the price moved significantly in the last 5 days? (momentum)
-
-It posts a morning watchlist to the Telegram channel like this:
-
-```
-MORNING SCAN — Wed May 27
-
-Top 10 stocks to watch today:
-
-1. NVDA  RSI: 27 | Vol: 3.1x avg | Momentum: +5.2%
-2. TSLA  RSI: 72 | Vol: 2.8x avg | Momentum: -3.8%
-3. META  RSI: 31 | Vol: 2.2x avg | Momentum: +2.1%
-...
-
-Monitoring these for signals until 11:00 PM.
-```
+1. **Scans all 503 S&P 500 stocks** before market open and picks the top 50 most interesting for the day
+2. **Posts a morning watchlist** to a private Telegram channel
+3. **After market close**, scans all 503 stocks for BUY signals using RSI + volume confirmation
+4. **Queues valid signals** and executes bracket orders at 9:25 AM ET the next morning
+5. **Monitors open positions** every 15 minutes — notifies when stop or target is hit
+6. **Posts a weekly performance report** every Sunday with full stats vs backtest baseline
 
 ---
 
-**Step 2 — After market closes (11:15 PM Finnish time)**
-
-Once the trading day is over and all price data is finalised, it checks those 10 stocks for signals using two indicators:
-
-**RSI (Relative Strength Index)**
-A number from 0–100 that tells you if a stock has been bought or sold too aggressively.
-- Below 30 → oversold → potential BUY opportunity
-- Above 70 → overbought → potential SELL opportunity
-
-**Moving Average Crossover**
-Compares the 20-day average price vs the 50-day average price.
-- 20-day crosses above 50-day → upward trend starting → BUY confirmation
-- 20-day crosses below 50-day → downward trend starting → SELL confirmation
-
-A signal only fires when **both agree** — this cuts out a lot of noise.
-
-When a signal fires, the channel gets a message like this:
+## Signal logic
 
 ```
-SIGNAL — BUY
-Stock:  NVDA
-Price:  $875.20  (real-time price)
-RSI:    27.4 (oversold)
-MA:     20MA crossed above 50MA
-Time:   11:15 PM Finnish time
+BUY signal fires when:
+  RSI(14) < 38          — stock is oversold on daily candles
+  Volume > 1.2× avg     — confirmed interest, not a quiet drift
+  SPY above 50MA        — only trade in bull market conditions
+  VIX < 25              — skip if fear/volatility is spiking
+  No earnings ±3 days   — avoid earnings volatility
 
-Reason: Strong oversold signal with MA confirmation
+Entry:       Market order at next-day open (9:30 AM ET)
+Stop loss:   Entry − (ATR × 3.5)
+Take profit: Entry + (ATR × 6.0)
+Position:    12% of portfolio per trade
+Max open:    5 positions simultaneously
 ```
+
+These parameters were confirmed across a 3-round backtesting framework on 2 years of S&P 500 data:
+- **+131.6% return** over 2 years on $5,000 starting capital
+- **74.3% win rate**
+- **3.23 profit factor**
+- **-3.4% max drawdown**
 
 ---
 
-**Step 3 — Daily summary**
+## Daily schedule (Finnish time)
 
-At the end of each day it posts a recap of everything that happened:
-
-```
-DAILY SUMMARY — Wed May 27
-
-Signals fired today: 2
-  BUY  NVDA @ 875.20  (11:15 PM)
-  SELL TSLA @ 218.40  (11:15 PM)
-
-Next scan: Tomorrow at 4:00 PM
-```
-
----
-
-## You can also ask it things directly
-
-The bot responds to commands:
-
-| Command | What happens |
+| Time | Job |
 |---|---|
-| `/watchlist` | Shows today's top 10 stocks |
-| `/signal NVDA` | Shows real-time price, RSI and moving average status for any stock |
-| `/chart NVDA` | Sends a price chart with all indicators as an image |
-| `/status` | Shows whether the bot is running and when the next scan is |
+| 4:00 PM | Morning scan — score all 503 stocks |
+| 4:20 PM | Post watchlist to Telegram |
+| 4:25 PM | Execute queued trades — bracket orders placed 5 min before open |
+| 4:30–11:00 PM | Monitor open positions every 15 min |
+| 11:15 PM | Auto-scan all 503 tickers for BUY signals, queue for tomorrow |
+| Sunday 8 PM | Weekly performance report posted to Telegram |
 
 ---
 
-## Important note
+## Telegram commands
 
-This bot is **signals only** — it tells me what looks interesting, I decide whether to act. No money is moved automatically. I place trades manually through my broker (IBKR) if I like what I see.
+| Command | What it does |
+|---|---|
+| `/watchlist` | Today's top scored stocks |
+| `/signal` | RSI + MA status for any ticker |
+| `/chart` | Price chart with indicators |
+| `/positions` | Open Alpaca positions with unrealised P&L |
+| `/trades` | Trade history + win rate + P&L |
+| `/report` | This week's performance report |
+| `/report all` | Full inception-to-date report vs backtest |
+| `/pause` | Pause auto-trading |
+| `/resume` | Resume auto-trading |
+| `/stopall confirm` | Emergency: cancel all orders + liquidate all positions |
+| `/status` | Bot health, schedule, trading stats |
+| `/mywatchlist` | Manage a custom watchlist |
+| `/scanmywatchlist` | Scan your custom watchlist for signals |
+| `/portfolio` | IBKR positions (when connected) |
 
 ---
 
-## Tech behind it
+## Project structure
 
-- Built in Python 3.9, runs on my Mac
-- Real-time stock prices from Alpaca Markets (free)
-- RSI & MA indicators from Yahoo Finance daily candles (free)
-- Signals delivered via Telegram
-- Scans all 500 S&P 500 companies every day
-- No subscriptions, no paid APIs
+```
+stock-signal-bot/
+├── main.py              — Entry point, all 5 scheduled jobs
+├── scanner.py           — Morning scan + run_auto_scan() for all 503 tickers
+├── signals.py           — RSI + MA analysis, price fetching
+├── telegram_bot.py      — All Telegram commands and channel posting
+├── charts.py            — Dark-mode price chart PNG
+├── watchlist.py         — Daily auto-generated watchlist (JSON)
+├── custom_watchlist.py  — Persistent custom watchlist per user
+├── ibkr.py              — IB Gateway connection (future live trading)
+├── config.py            — All constants and strategy parameters
+├── trader.py            — Alpaca bracket order execution + circuit breakers
+├── trade_logger.py      — CSV trade log + pending queue + pause flag
+├── reporter.py          — Weekly and inception-to-date performance reports
+├── backtester.py        — Swing strategy backtester (3-round framework complete)
+├── intraday_backtester.py — Intraday backtester (15-min, tested and concluded)
+├── .env                 — API keys (never commit)
+├── requirements.txt     — Python dependencies
+├── trades.csv           — All trade records (auto-created)
+├── pending_trades.json  — Trades queued for next morning (auto-created)
+└── watchlist.json       — Daily watchlist (auto-created)
+```
 
 ---
 
@@ -124,4 +110,21 @@ cd ~/Desktop/stock-signal-bot
 /Library/Developer/CommandLineTools/usr/bin/python3.9 main.py
 ```
 
-> Use Python 3.9 specifically — newer versions (3.14+) are not compatible with python-telegram-bot 20.7.
+> Always use Python 3.9. The system `python3` points to 3.14 which breaks python-telegram-bot 20.7.
+
+Currently running in **paper trading mode** (`PAPER_TRADING = True` in `config.py`).  
+Switch to live by setting `PAPER_TRADING = False` after validating paper performance.
+
+---
+
+## Tech stack
+
+| Component | Library |
+|---|---|
+| Language | Python 3.9 |
+| Market data | yfinance (daily), Alpaca IEX (intraday/real-time) |
+| Indicators | ta library |
+| Order execution | alpaca-py (paper → live) |
+| Telegram | python-telegram-bot 20.7 |
+| Scheduling | APScheduler |
+| Charts | matplotlib |

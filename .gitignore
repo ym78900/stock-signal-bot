@@ -1,7 +1,11 @@
 .env
 watchlist.json
 custom_watchlist.json
+pending_trades.json
+trades.csv
 __pycache__/
 *.pyc
 *.pyo
+*.pkl
+*.csv
 .DS_Store
