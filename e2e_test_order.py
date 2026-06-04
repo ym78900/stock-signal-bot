@@ -33,8 +33,11 @@ Usage:
 """
 
 import argparse
+import os
 import sys
+import tempfile
 import time
+import uuid
 from datetime import date
 
 from dotenv import load_dotenv
@@ -174,6 +177,113 @@ def run_test(ticker: str, qty: int, trail: float, log_it: bool) -> int:
     return 0
 
 
+def simulate(ticker: str, qty: int, fill: float, atr: float,
+             trail: float, exit_price: float) -> int:
+    """
+    Fully offline simulation of the live trade lifecycle.
+
+    Touches NO market and places NO order. It mocks the Alpaca fill and the
+    trailing-stop order, then drives the exact same logging chain the live
+    bot uses (log_order_placed -> update_trade_after_fill -> mark_trade_closed)
+    and renders the resulting report — so you can watch the whole process now.
+
+    To avoid polluting the real trades.csv, the trade log is redirected to a
+    throwaway temp file for the duration of this run.
+    """
+    print("=" * 60)
+    print(f" SIMULATION (offline, no market, no orders) — {ticker} x{qty}")
+    print("=" * 60)
+
+    # ── redirect the trade log to a throwaway file ────────────────────────────
+    sim_log = os.path.join(tempfile.gettempdir(),
+                           f"sim_trades_{date.today().isoformat()}.csv")
+    if os.path.exists(sim_log):
+        os.remove(sim_log)
+    real_log = tlog.TRADE_LOG
+    tlog.TRADE_LOG = sim_log
+    print(f"Throwaway trade log: {sim_log}")
+    print(f"(real trades.csv at {real_log} is NOT touched)\n")
+
+    try:
+        # ── derive the trailing distance the same way the live path does ──────
+        if atr > 0:
+            trail = round(atr * config.ATR_STOP_MULTIPLIER, 2)
+            print(f"Trail = ATR({atr}) x {config.ATR_STOP_MULTIPLIER} = ${trail}")
+        elif trail > 0:
+            print(f"Trail = ${trail} (provided)")
+        else:
+            trail = round(max(0.25, fill * 0.05), 2)
+            print(f"Trail = ${trail} (auto ~5% of fill)")
+
+        entry_order_id = f"SIM-{uuid.uuid4().hex[:8]}"
+        exit_order_id  = f"SIM-{uuid.uuid4().hex[:8]}"
+
+        # ── Phase 1: market buy placed (mocked) ───────────────────────────────
+        print(f"\n[1] Market buy placed (mock id {entry_order_id})")
+        tlog.log_order_placed(
+            ticker          = ticker,
+            signal_date     = str(date.today()),
+            entry_price_est = fill,
+            stop_price      = None,
+            target_price    = None,
+            qty             = qty,
+            alpaca_order_id = entry_order_id,
+        )
+
+        # ── Phase 2: fill confirmed + trailing stop attached (mocked) ─────────
+        init_stop = round(fill - trail, 2)
+        print(f"[2] FILLED @ ${fill}  ->  trailing stop attached "
+              f"(mock id {exit_order_id}, initial stop ${init_stop})")
+        tlog.update_trade_after_fill(
+            entry_order_id = entry_order_id,
+            fill_price     = fill,
+            stop_price     = init_stop,
+            target_price   = None,
+            oco_order_id   = exit_order_id,
+        )
+
+        # show OPEN state
+        import importlib
+        import reporter
+        importlib.reload(reporter)  # pick up redirected TRADE_LOG via tlog
+        open_trades = tlog.get_open_trades()
+        print(f"\n--- State after entry: {len(open_trades)} open position(s) ---")
+        for t in open_trades:
+            print(f"    {t['ticker']}  qty={t['qty']}  entry=${t['entry_price']}  "
+                  f"stop=${t['stop_price']}  exit-order={t['alpaca_order_id']}")
+
+        # ── Phase 3: exit (mocked trailing-stop fill) ─────────────────────────
+        if exit_price <= 0:
+            exit_price = round(fill + trail, 2)  # default: a modest winning exit
+        gross = round((exit_price - fill) * qty, 2)
+        print(f"\n[3] Trailing stop fills @ ${exit_price}  "
+              f"(simulated exit, gross ${gross:+,.2f} before fees)")
+        closed = tlog.mark_trade_closed(
+            alpaca_order_id = exit_order_id,
+            exit_price      = exit_price,
+            exit_date       = str(date.today()),
+            exit_reason     = "trailing_stop",
+        )
+        if closed:
+            print(f"    closed: net ${closed['net_pnl']}  ({closed['pnl_pct']}%)  "
+                  f"win={closed['win']}")
+
+        # ── Phase 4: the report the bot would post ────────────────────────────
+        print("\n[4] Inception report the bot would post to Telegram:")
+        print("-" * 60)
+        print(reporter.build_inception_report())
+        print("-" * 60)
+
+        print("\n" + "=" * 60)
+        print(" SIMULATION COMPLETE — full lifecycle exercised offline.")
+        print(" buy -> fill -> trailing stop -> exit -> log -> report all ran.")
+        print(f" Inspect the throwaway log at: {sim_log}")
+        print("=" * 60)
+        return 0
+    finally:
+        tlog.TRADE_LOG = real_log  # always restore the real path
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Controlled single-order paper test.")
     p.add_argument("--ticker", default="F", help="ticker to buy (default: F)")
@@ -182,6 +292,16 @@ def main() -> int:
                    help="trailing stop distance in $ (default: auto ~5%% of fill)")
     p.add_argument("--dry-run", action="store_true",
                    help="validate only, place NO order")
+    p.add_argument("--simulate", action="store_true",
+                   help="offline: mock the fill + exit and run the full logging/"
+                        "report chain now (no market, no order)")
+    p.add_argument("--fill", type=float, default=10.0,
+                   help="[--simulate] mock entry fill price (default: 10.00)")
+    p.add_argument("--atr", type=float, default=0.0,
+                   help="[--simulate] ATR to derive trail = ATR x stop-mult "
+                        "(overrides --trail)")
+    p.add_argument("--exit", type=float, default=0.0, dest="exit_price",
+                   help="[--simulate] mock exit price (default: fill + trail)")
     p.add_argument("--no-log", action="store_true",
                    help="do not write to trades.csv")
     p.add_argument("--liquidate", action="store_true",
@@ -191,6 +311,10 @@ def main() -> int:
     if args.liquidate:
         liquidate()
         return 0
+
+    if args.simulate:
+        return simulate(args.ticker, args.qty, args.fill, args.atr,
+                        args.trail, args.exit_price)
 
     if args.dry_run:
         print("DRY RUN — no order will be placed. Running preflight instead:")

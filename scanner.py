@@ -261,11 +261,15 @@ def fetch_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
 
 def _score_stock(ticker: str, df: pd.DataFrame) -> Optional[dict]:
     """
-    Score a single stock on three dimensions:
-      - Volume: today's volume vs 20-day average
-      - RSI:    how close RSI is to the buy (30) or sell (70) zone
-      - Momentum: % price change over the last 5 days
+    Score a single stock on three dimensions for the WATCHLIST ranking
+    (best-to-buy first). Buy-readiness oriented for a long-only strategy:
+      - Volume:   today's volume vs 20-day average (more interest = higher)
+      - RSI:      how OVERSOLD it is — lower RSI ranks higher (buys are RSI < 38)
+      - Momentum: size of the recent 5-day move
     Returns a dict with the score and raw values, or None if data is invalid.
+
+    NOTE: display/ranking only — trade selection is done independently in
+    run_auto_scan() and is not affected by this score.
     """
     try:
         # ── Liquidity guard ───────────────────────────────────────────────────
@@ -306,12 +310,16 @@ def _score_stock(ticker: str, df: pd.DataFrame) -> Optional[dict]:
         # Volume score: cap at 5x average → maps to 1.0
         volume_score = min(volume_ratio / 5.0, 1.0)
 
-        # RSI score: distance from the neutral midpoint (50)
-        # RSI of 30 → distance = 20 → score = 1.0
-        # RSI of 70 → distance = 20 → score = 1.0
-        # RSI of 50 → distance = 0  → score = 0.0
-        rsi_distance = abs(rsi - 50)
-        rsi_score = min(rsi_distance / 20.0, 1.0)
+        # RSI score: BUY-READINESS — rewards OVERSOLD only.
+        # The strategy is long-only mean-reversion (buys RSI < 38), so a lower
+        # RSI means "closer to a BUY" and should rank higher. Overbought stocks
+        # are NOT buy candidates and score 0.
+        #   RSI 30 → 1.0    RSI 38 → 0.6    RSI 50 → 0.0    RSI 70 → 0.0
+        # (Previously abs(rsi-50) ranked an overbought RSI 70 just as high as an
+        #  oversold RSI 30 — misleading for a list of "best to buy". This is a
+        #  watchlist-display change only; the trade scan in run_auto_scan is
+        #  unaffected.)
+        rsi_score = min(max((50 - rsi) / 20.0, 0.0), 1.0)
 
         # Momentum score: absolute % move, cap at 10% → 1.0
         momentum_score = min(abs(momentum_pct) / 10.0, 1.0)
