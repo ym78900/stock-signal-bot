@@ -22,13 +22,17 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ── Backtest baseline (confirmed from 3-round framework, May 2026) ────────────
+# ── Backtest baseline (Round 8 corrected — concurrency-aware sim, June 2026) ──
+# Earlier baseline (74.3% win / PF 3.23 / +131.6%) was a fictional artifact of the
+# simulate_fast() cap/cash bug. These are the corrected locked numbers:
+# cap=7, 12% size, $5k, trailing 3.5x ATR → +$1,568 (+31.4%), 51.5% win, PF 1.86,
+# DD 10.5%, 101 trades over 2 years (~50/yr). See CONTEXT.md "Round 8".
 BACKTEST = {
-    "win_rate_pct":     74.3,
-    "profit_factor":    3.23,
-    "max_drawdown_pct": 3.4,
-    "return_2yr_pct":   131.6,
-    "trades_per_year":  68,
+    "win_rate_pct":     51.5,
+    "profit_factor":    1.86,
+    "max_drawdown_pct": 10.5,
+    "return_2yr_pct":   31.4,
+    "trades_per_year":  50,
 }
 
 STARTING_CAPITAL = 5000.0
@@ -115,10 +119,14 @@ def build_weekly_report(week_end: Optional[date] = None) -> str:
         if week_trades else 0.0
     )
 
-    # Exit breakdown for the week
-    week_tp  = len([t for t in week_trades if t.get("exit_reason") == "take_profit"])
-    week_sl  = len([t for t in week_trades if t.get("exit_reason") == "stop_loss"])
-    week_oth = len(week_trades) - week_tp - week_sl
+    # Exit breakdown for the week.
+    # Live strategy is trailing-stop only (no fixed target). Exits are tagged
+    # "trailing_stop" or "max_hold"; legacy rows may use take_profit/stop_loss.
+    week_trail = len([t for t in week_trades
+                      if t.get("exit_reason") in ("trailing_stop", "take_profit")])
+    week_hold  = len([t for t in week_trades if t.get("exit_reason") == "max_hold"])
+    week_sl    = len([t for t in week_trades if t.get("exit_reason") == "stop_loss"])
+    week_oth   = len(week_trades) - week_trail - week_hold - week_sl
 
     # Best / worst trade this week
     best  = max(week_trades, key=_pnl) if week_trades else None
@@ -168,9 +176,10 @@ def build_weekly_report(week_end: Optional[date] = None) -> str:
             f"Profit factor: {week_pf}",
             f"",
             f"Exit breakdown:",
-            f"  Target hit: {week_tp}",
-            f"  Stop hit:   {week_sl}",
-            (f"  Other:      {week_oth}" if week_oth else ""),
+            f"  Trailing stop: {week_trail}",
+            f"  Max hold:      {week_hold}",
+            (f"  Stop hit:      {week_sl}" if week_sl else ""),
+            (f"  Other:         {week_oth}" if week_oth else ""),
         ]
         lines = [l for l in lines if l != ""]  # remove empty conditional lines
 
@@ -243,8 +252,10 @@ def build_inception_report() -> str:
     avg_win      = round(sum(_pnl(t) for t in wins) / len(wins), 2) if wins else 0
     avg_loss     = round(sum(_pnl(t) for t in losses) / len(losses), 2) if losses else 0
 
-    tp_exits = len([t for t in all_closed if t.get("exit_reason") == "take_profit"])
-    sl_exits = len([t for t in all_closed if t.get("exit_reason") == "stop_loss"])
+    trail_exits = len([t for t in all_closed
+                       if t.get("exit_reason") in ("trailing_stop", "take_profit")])
+    hold_exits  = len([t for t in all_closed if t.get("exit_reason") == "max_hold"])
+    sl_exits    = len([t for t in all_closed if t.get("exit_reason") == "stop_loss"])
 
     best  = max(all_closed, key=_pnl)
     worst = min(all_closed, key=_pnl)
@@ -274,8 +285,10 @@ def build_inception_report() -> str:
         f"Avg loss:      ${avg_loss:+,.2f}",
         f"",
         f"*Exits*",
-        f"Target hit:    {tp_exits}  ({round(tp_exits/len(all_closed)*100)}%)",
-        f"Stop hit:      {sl_exits}  ({round(sl_exits/len(all_closed)*100)}%)",
+        f"Trailing stop: {trail_exits}  ({round(trail_exits/len(all_closed)*100)}%)",
+        f"Max hold:      {hold_exits}  ({round(hold_exits/len(all_closed)*100)}%)",
+        (f"Stop hit:      {sl_exits}  ({round(sl_exits/len(all_closed)*100)}%)"
+         if sl_exits else ""),
         f"",
         f"*Best trade:*  {best['ticker']}  ${_pnl(best):+,.2f}",
         f"*Worst trade:* {worst['ticker']}  ${_pnl(worst):+,.2f}",
