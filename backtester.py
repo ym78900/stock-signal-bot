@@ -382,7 +382,21 @@ def precompute_exits(
     if os.path.exists(cache_path):
         logger.info("Loading precomputed exits from cache...")
         with open(cache_path, "rb") as f:
-            return pickle.load(f)
+            cached = pickle.load(f)
+        # Guard: the cache is returned regardless of the requested grid, so verify the
+        # requested (stop, target) combos are actually present. If not, a simulation
+        # would silently get None outcomes and skip every trade — fail loudly instead.
+        requested = [(s, t) for s in atr_stop_values for t in atr_target_values if t / s >= 1.5]
+        if cached and requested:
+            available = set(cached[0].get("exit_outcomes", {}).keys())
+            missing = [c for c in requested if c not in available]
+            if missing:
+                logger.warning(
+                    f"Exit cache ({os.path.basename(cache_path)}) is MISSING requested "
+                    f"ATR combos {missing}. Delete the cache to regenerate, or these "
+                    f"combos will produce zero trades. Available: {sorted(available)}"
+                )
+        return cached
 
     logger.info(f"Precomputing exit outcomes for {len(rows)} candidates × "
                 f"{len(atr_stop_values) * len(atr_target_values)} ATR combos...")
@@ -674,14 +688,15 @@ def simulate_fast(
         if max_hold_days is not None and outcome["days_held"] > max_hold_days:
             close_key = f"close_at_{max_hold_days}d"
             time_exit_price = row.get(close_key)
-            if time_exit_price is not None:
-                outcome = {
-                    "exit_price":    round(time_exit_price, 2),
-                    "exit_reason":   f"max_hold_{max_hold_days}d",
-                    "days_held":     max_hold_days,
-                    "pnl_per_share": time_exit_price - row["open_next"],
-                }
-            continue
+            if time_exit_price is None:
+                # No precomputed time-exit price available — can't model it, skip the trade
+                continue
+            outcome = {
+                "exit_price":    round(time_exit_price, 2),
+                "exit_reason":   f"max_hold_{max_hold_days}d",
+                "days_held":     max_hold_days,
+                "pnl_per_share": time_exit_price - row["open_next"],
+            }
 
         entry_price = row["open_next"]
 
@@ -857,6 +872,8 @@ def simulate_concurrent(
     sizing_mode: str = "fixed_pct",
     enforce_cash: bool = True,
     trail_mult: Optional[float] = None,
+    sector_map: Optional[Dict[str, str]] = None,
+    max_per_sector: Optional[int] = None,
     **filter_kwargs,
 ) -> Tuple[List[dict], dict]:
     """
@@ -948,6 +965,16 @@ def simulate_concurrent(
             continue
         if len(open_positions) >= max_open_pos:
             continue
+
+        # Sector diversification guard (no-op unless both args provided)
+        if sector_map is not None and max_per_sector is not None:
+            sec = sector_map.get(ticker, "Unknown")
+            open_in_sector = sum(
+                1 for p in open_positions
+                if sector_map.get(p["ticker"], "Unknown") == sec
+            )
+            if open_in_sector >= max_per_sector:
+                continue
 
         entry_price = row["open_next"]
         if entry_price <= 0:

@@ -9,49 +9,63 @@
 
 ## Priority 1 — Safe to implement now (no backtesting required)
 
-### 1. RSI-turning confirmation
-**File:** `scanner.py` → `run_auto_scan()`  
-**Change:** Only fire a BUY signal when `rsi_today > rsi_yesterday` — i.e. RSI has
-stopped falling and is starting to turn up. Currently the signal fires the moment RSI
-drops below 38, even if it is still declining (catching a falling knife).  
-**Expected effect:** Fewer signals but higher win rate (+5–10 pp). Reduces false entries
-on stocks in free-fall.  
-**Risk:** Low. Additive filter — only removes trades, never adds new ones.
-
-```python
-# In run_auto_scan(), after computing rsi:
-rsi_prev = float(rsi_series.iloc[-2])
-if rsi <= rsi_prev:   # RSI still falling — skip
-    continue
-```
-
----
-
-### 2. Sector diversification guard
+### 1. Sector diversification guard
 **Files:** `scanner.py` → `get_sp500_tickers()`, `main.py` → `job_execute_trades()`  
 **Change:** Pull the GICS sector column from the S&P 500 Wikipedia table (already
 fetched in `get_sp500_tickers()`). Before placing a new trade, count how many open
-positions are already in the same sector. Skip the trade if the count is ≥ 2.  
-**Expected effect:** Prevents correlated drawdowns (e.g. 7 tech stocks all dropping
-together in a sector rotation). Reduces max drawdown in sector-specific selloffs.  
-**Risk:** Low. No change to signal logic. Adds a pre-trade guard in execution.
+positions are already in the same sector. Skip the trade if the count hits the cap.  
+
+**MEASURED (Round 9, `round9_sector_guard.py` — trailing 3.5×, cap=7, $5k, 2yr):**
+
+| Sector cap | Trades | Win% | P&L | MaxDD | PF |
+|---|---|---|---|---|---|
+| none (baseline) | 101 | 51.5% | +$1,568 | 10.5% | 1.86 |
+| **4 per sector** | 101 | 51.5% | **+$1,574** | **5.7%** | 1.89 |
+| 3 per sector | 97 | 48.5% | +$1,492 | 9.4% | 1.83 |
+| 2 per sector | 106 | 40.6% | +$982 | 12.7% | 1.46 |
+| 1 per sector | 99 | 45.5% | +$1,196 | 7.7% | 1.68 |
+
+**Result:** the originally-proposed cap of **2 per sector is the WORST** option (−37%
+P&L, *higher* DD, win% collapses to 40.6%) — a tight cap frees slots/cash for lower
+quality substitute trades. The sweet spot is **4 per sector**: essentially identical
+P&L (+$1,574) with **max drawdown nearly halved (10.5% → 5.7%)** and 0 net trades
+dropped. It doesn't remove trades — it stops a same-sector cluster being open at once
+during the drawdown, smoothing the equity path.  
+
+**Status:** ❌ REJECTED — failed the split-half robustness check (`round10_sector_robustness.py`).
+The full-window DD improvement does **not** reproduce in either half:
+
+| Window | Cap | Trades | Win% | P&L | MaxDD | PF |
+|---|---|---|---|---|---|---|
+| First half | none | 49 | 57.1% | +$780 | 2.9% | 2.12 |
+| First half | 4/sec | 49 | 55.1% | +$630 | **2.9%** | 1.82 |
+| Second half | none | 59 | 52.5% | +$1,262 | 5.4% | 2.13 |
+| Second half | 4/sec | 59 | 52.5% | +$1,262 | **5.4%** | 2.13 |
+
+Within each half the guard barely binds: drawdown is **unchanged** in both halves, and
+in the first half it actively *hurts* P&L (−$151, win% 57.1→55.1, PF 2.12→1.82). The
+full-window 10.5%→5.7% DD drop was a **path-stitching artifact** of the realized,
+exit-ordered drawdown metric (a couple of early sector blocks cascade into a different
+2-year trade ordering that happens to smooth the stitched equity curve) — not a real
+risk reduction. Same lesson as the trailing-3.0× episode. **Do not add a sector cap.**
+**Risk:** Low to implement, but no measured benefit — so not worth the added complexity.
 
 ```python
 # Example structure to add to scanner.py:
 _sp500_sectors: Dict[str, str] = {}  # { "NVDA": "Information Technology", ... }
 # Populate alongside _sp500_names in get_sp500_tickers()
 
-# In job_execute_trades(), before place_market_buy():
+# In job_execute_trades(), before place_market_buy():  (cap = 4, per Round 9)
 sector = scanner._sp500_sectors.get(ticker, "Unknown")
 open_in_sector = sum(1 for t in open_trades if scanner._sp500_sectors.get(t["ticker"]) == sector)
-if open_in_sector >= 2:
+if open_in_sector >= 4:
     skipped.append(f"{ticker} (sector cap reached: {sector})")
     continue
 ```
 
 ---
 
-### 3. Post-close extended-hours price monitor
+### 2. Post-close extended-hours price monitor
 **File:** `main.py` — new scheduled job  
 **Change:** Add a job at ~8:00 PM Finnish (1:00 PM ET, mid after-hours) that checks
 unrealized gain on each open position via `fetch_realtime_price()`. If the unrealized
@@ -66,6 +80,28 @@ the trailing stop already filled (check `get_closed_bracket_legs()` first).
 ---
 
 ## Priority 2 — Needs backtesting before changing
+
+### 3. RSI-turning confirmation
+**File:** `scanner.py` → `run_auto_scan()`  
+**Change:** Only fire a BUY signal when `rsi_today > rsi_yesterday` — i.e. RSI has
+stopped falling and is starting to turn up. Currently the signal fires the moment RSI
+drops below 38, even if it is still declining (catching a falling knife).  
+**Expected effect:** Fewer signals, potentially a higher win rate — but this is a
+**hypothesis, not a measured result**. It changes which trades fire (and their
+outcomes), so it is a signal-logic change, not a free additive filter, and must be
+validated with `simulate_concurrent()` before adoption.  
+**Risk:** Medium. Reduces signal count; could also remove eventual winners that dipped
+once more before reversing. Confirm total P&L does not fall below the current baseline
+(+$1,568 / 2yr) and check the win-rate delta empirically.
+
+```python
+# In run_auto_scan(), after computing rsi (needs the prior bar's RSI in scope):
+rsi_prev = float(rsi_series.iloc[-2])
+if rsi <= rsi_prev:   # RSI still falling — skip
+    continue
+```
+
+---
 
 ### 4. Volume confirmation threshold raise (1.2× → 1.5×)
 **File:** `config.py` → `VOLUME_CONFIRMATION_RATIO`  
