@@ -213,14 +213,64 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # ── /watchlist low or /watchlist high — live RSI scan ────────────────────
     if mode in ("low", "high"):
-        label = "oversold (buy candidates)" if mode == "low" else "overbought (extended)"
+        label = "oversold — buy candidates" if mode == "low" else "overbought — extended"
         await update.message.reply_text(
             f"Scanning all S&P 500 stocks for {label}... (~60s)"
         )
-        stocks = sc.run_watchlist_scan(mode=mode)
-        if not stocks:
-            await update.message.reply_text("Scan returned no results. Try again later.")
+        scan = sc.run_watchlist_scan(mode=mode)
+        results = scan["results"]
+
+        if not results:
+            criteria = (
+                f"RSI < {config.WATCHLIST_LOW_RSI_MAX} + volume ≥ {config.WATCHLIST_VOL_MIN}×"
+                if mode == "low" else
+                f"RSI > {config.WATCHLIST_HIGH_RSI_MIN} + volume ≥ {config.WATCHLIST_VOL_MIN}×"
+            )
+            await update.message.reply_text(
+                f"No stocks passed the filter ({criteria}) out of "
+                f"{scan['total']} scanned. Market may be neutral today."
+            )
             return
+
+        top = results[:50]
+        mode_header = "OVERSOLD — Buy Candidates" if mode == "low" \
+                      else "OVERBOUGHT — Extended"
+        criteria_note = (
+            f"RSI < {config.WATCHLIST_LOW_RSI_MAX:.0f} + Vol ≥ {config.WATCHLIST_VOL_MIN}×"
+            if mode == "low" else
+            f"RSI > {config.WATCHLIST_HIGH_RSI_MIN:.0f} + Vol ≥ {config.WATCHLIST_VOL_MIN}×"
+        )
+        lines = [
+            f"*{mode_header}*",
+            f"_{scan['filtered']} of {scan['total']} stocks passed filter "
+            f"({criteria_note})_",
+            f"_{datetime.now(config.TIMEZONE).strftime('%a %b %-d, %H:%M')}_",
+            "",
+        ]
+
+        for i, s in enumerate(top, 1):
+            rsi = s["rsi"]
+            if rsi <= config.RSI_BUY_THRESHOLD:
+                rsi_tag = f"RSI {rsi} 🟢"
+            elif rsi >= config.RSI_SELL_THRESHOLD:
+                rsi_tag = f"RSI {rsi} 🔴"
+            else:
+                rsi_tag = f"RSI {rsi}"
+            mom = s["momentum_pct"]
+            mom_str = f"{'+' if mom >= 0 else ''}{mom}%"
+            lines.append(
+                f"{i}. *{s['ticker']}*  {rsi_tag}  |  "
+                f"5d: {mom_str}  |  Vol {s['volume_ratio']}×"
+            )
+
+        lines += ["", "_🟢 RSI below buy threshold   🔴 RSI overbought_",
+                  "_/watchlist low · /watchlist high_"]
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = "\n".join(lines[:55])
+
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        return
 
         top = stocks[:50]
         mode_header = "OVERSOLD — Low RSI (buy candidates)" if mode == "low" \

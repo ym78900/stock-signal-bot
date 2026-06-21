@@ -385,27 +385,37 @@ def run_morning_scan() -> List[dict]:
     return top
 
 
-def run_watchlist_scan(mode: str = "low") -> List[dict]:
+def run_watchlist_scan(mode: str = "low") -> dict:
     """
-    On-demand watchlist scan with a sort mode:
+    On-demand watchlist scan with quality filtering.
 
-      mode="low"  — oversold stocks ranked by LOWEST RSI first.
-                    These are buy candidates (RSI < 50, ideally < 38).
-      mode="high" — overbought stocks ranked by HIGHEST RSI first.
-                    These are extended/potentially stretched stocks (RSI > 50).
+      mode="low"  — oversold candidates:
+                    RSI < WATCHLIST_LOW_RSI_MAX (45) AND volume >= WATCHLIST_VOL_MIN (1.0×)
+                    Sorted by lowest RSI first (most oversold = top of list).
+                    Every stock shown has BOTH an oversold RSI AND buyers showing up —
+                    filters out falling knives with no volume.
 
-    Returns all scored stocks (no top-N cap) sorted by the chosen direction,
-    so the caller can decide how many to show.
+      mode="high" — overbought / extended:
+                    RSI > WATCHLIST_HIGH_RSI_MIN (60) AND volume >= WATCHLIST_VOL_MIN (1.0×)
+                    Sorted by highest RSI first (most stretched = top of list).
+
+    Returns a dict:
+      {
+        "results":   [...],   # filtered + sorted stock dicts
+        "total":     int,     # total stocks scored (before filter)
+        "filtered":  int,     # stocks that passed the filter
+        "mode":      str,     # "low" or "high"
+      }
     """
     tickers = get_extended_tickers()
     if not tickers:
         logger.error("No tickers available — aborting scan.")
-        return []
+        return {"results": [], "total": 0, "filtered": 0, "mode": mode}
 
     data = fetch_data(tickers)
     if not data:
         logger.error("No data returned from yfinance — aborting scan.")
-        return []
+        return {"results": [], "total": 0, "filtered": 0, "mode": mode}
 
     scores = []
     for ticker, df in data.items():
@@ -413,15 +423,29 @@ def run_watchlist_scan(mode: str = "low") -> List[dict]:
         if result:
             scores.append(result)
 
-    if mode == "low":
-        # Lowest RSI first — most oversold / best buy candidates at the top
-        scores.sort(key=lambda x: x["rsi"])
-    else:
-        # Highest RSI first — most overbought / most extended at the top
-        scores.sort(key=lambda x: x["rsi"], reverse=True)
+    total = len(scores)
 
-    logger.info(f"Watchlist scan ({mode}): {len(scores)} stocks scored.")
-    return scores
+    # ── Apply quality filter ──────────────────────────────────────────────────
+    if mode == "low":
+        filtered = [
+            s for s in scores
+            if s["rsi"] < config.WATCHLIST_LOW_RSI_MAX
+            and s["volume_ratio"] >= config.WATCHLIST_VOL_MIN
+        ]
+        filtered.sort(key=lambda x: x["rsi"])          # most oversold first
+    else:
+        filtered = [
+            s for s in scores
+            if s["rsi"] > config.WATCHLIST_HIGH_RSI_MIN
+            and s["volume_ratio"] >= config.WATCHLIST_VOL_MIN
+        ]
+        filtered.sort(key=lambda x: x["rsi"], reverse=True)  # most overbought first
+
+    logger.info(
+        f"Watchlist scan ({mode}): {total} scored, "
+        f"{len(filtered)} passed filter."
+    )
+    return {"results": filtered, "total": total, "filtered": len(filtered), "mode": mode}
 
 
 # ── Auto-trading scan (all 503 tickers, used at 11:15 PM) ────────────────────

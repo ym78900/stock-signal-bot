@@ -135,3 +135,12 @@ MAX_HOLD_DAYS             = 60    # Force-close position after 60 calendar days
 #   Full NYSE+NASDAQ (5,177 tickers) produces only 18 trades vs 78 — filters reject small-caps
 EXTENDED_UNIVERSE_ENABLED = False
 NASDAQ100_WIKIPEDIA_URL   = "https://en.wikipedia.org/wiki/Nasdaq-100"
+
+# ── Watchlist filter thresholds (display only — not used in trade selection) ──
+# /watchlist low  — oversold filter: RSI below this AND volume above floor
+# /watchlist high — overbought filter: RSI above this AND volume above floor
+# Volume floor is set below the trade threshold (1.2×) to catch stocks that are
+# approaching a signal, not just ones that have already triggered it.
+WATCHLIST_LOW_RSI_MAX  = 45.0   # show stocks with RSI < this (approaching buy zone)
+WATCHLIST_HIGH_RSI_MIN = 60.0   # show stocks with RSI > this (approaching overbought)
+WATCHLIST_VOL_MIN      = 1.0    # minimum volume ratio for both lists (filters dry movers)
