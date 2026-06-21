@@ -26,7 +26,7 @@ SP500_WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies
 TOP_N_STOCKS = 50          # How many stocks to put on the daily watchlist
 
 # ── yfinance fetch settings ───────────────────────────────────────────────────
-DATA_PERIOD   = "60d"      # 60 days of history (enough for 50-day MA + ATR)
+DATA_PERIOD   = "120d"     # 120 days (~85 trading days) — enough for 50-day MA + buffer
 DATA_INTERVAL = "1d"       # Daily candles
 
 # ── Signal thresholds ─────────────────────────────────────────────────────────

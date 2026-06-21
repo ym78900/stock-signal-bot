@@ -137,6 +137,49 @@ def fetch_ticker_data(ticker: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def fetch_earnings_growth(ticker: str) -> dict:
+    """
+    Fetch YoY quarterly earnings and revenue growth from yfinance.
+    Returns a dict with eps_growth_pct, revenue_growth_pct, and next_earnings_date.
+    All fields default to None on failure — this is supplementary data, never blocks signal.
+    """
+    result = {
+        "eps_growth_pct":     None,
+        "revenue_growth_pct": None,
+        "next_earnings_date": None,
+    }
+    try:
+        info = yf.Ticker(ticker).info
+        eg = info.get("earningsQuarterlyGrowth")
+        rg = info.get("revenueQuarterlyGrowth")
+        if eg is not None:
+            result["eps_growth_pct"] = round(eg * 100, 1)
+        if rg is not None:
+            result["revenue_growth_pct"] = round(rg * 100, 1)
+    except Exception as e:
+        logger.debug(f"Earnings growth fetch failed for {ticker}: {e}")
+
+    try:
+        cal = yf.Ticker(ticker).calendar
+        if cal is not None and not cal.empty:
+            if "Earnings Date" in cal.index:
+                earn_dt = cal.loc["Earnings Date"].iloc[0]
+            elif len(cal) > 0:
+                earn_dt = cal.iloc[0, 0]
+            else:
+                earn_dt = None
+            if earn_dt is not None:
+                from datetime import date
+                if hasattr(earn_dt, "date"):
+                    result["next_earnings_date"] = str(earn_dt.date())
+                else:
+                    result["next_earnings_date"] = str(earn_dt)[:10]
+    except Exception as e:
+        logger.debug(f"Earnings date fetch failed for {ticker}: {e}")
+
+    return result
+
+
 def analyse(ticker: str, df: pd.DataFrame, company_name: Optional[str] = None) -> dict:
     """
     Run RSI + MA analysis on a daily DataFrame.
@@ -156,19 +199,26 @@ def analyse(ticker: str, df: pd.DataFrame, company_name: Optional[str] = None) -
       }
     """
     result = {
-        "ticker":        ticker,
-        "company_name":  company_name or get_company_name(ticker),
-        "price":         None,
-        "rsi":           None,
-        "ma_fast":       None,
-        "ma_slow":       None,
-        "signal":        "NONE",
-        "rsi_signal":    False,
-        "ma_crossover":  False,
-        "crossover_dir": None,
-        "reason":        "",
-        "last_candle":   None,   # Date of the most recent daily candle
+        "ticker":              ticker,
+        "company_name":        company_name or get_company_name(ticker),
+        "price":               None,
+        "rsi":                 None,
+        "ma_fast":             None,
+        "ma_slow":             None,
+        "signal":              "NONE",
+        "rsi_signal":          False,
+        "ma_crossover":        False,
+        "crossover_dir":       None,
+        "reason":              "",
+        "last_candle":         None,
+        "eps_growth_pct":      None,
+        "revenue_growth_pct":  None,
+        "next_earnings_date":  None,
     }
+
+    # Fetch earnings data (non-blocking — failures silently leave fields as None)
+    earnings = fetch_earnings_growth(ticker)
+    result.update(earnings)
 
     try:
         # ── Price + last candle date ──────────────────────────────────────────

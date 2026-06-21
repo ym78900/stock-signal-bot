@@ -79,60 +79,110 @@ def format_watchlist_message(stocks: List[dict]) -> str:
 
 
 def format_signal_message(analysis: dict) -> str:
-    fast = analysis["ma_fast"]
-    slow = analysis["ma_slow"]
+    fast = analysis.get("ma_fast")
+    slow = analysis.get("ma_slow")
+    rsi  = analysis.get("rsi")
 
-    if analysis["ma_crossover"]:
-        if analysis["crossover_dir"] == "UP":
-            ma_line = f"20-day avg (${fast}) just crossed ABOVE 50-day avg (${slow}) — uptrend starting"
+    # ── RSI label — uses actual buy/sell thresholds, not generic 30/70 ────────
+    if rsi is not None:
+        if rsi <= config.RSI_BUY_THRESHOLD:          # ≤ 38 — actual buy zone
+            rsi_label = f"oversold — buy zone (threshold: {config.RSI_BUY_THRESHOLD})"
+        elif rsi <= 45:
+            rsi_label = "approaching oversold — watch"
+        elif rsi >= config.RSI_SELL_THRESHOLD:       # ≥ 55 — overbought label
+            rsi_label = "overbought"
         else:
-            ma_line = f"20-day avg (${fast}) just crossed BELOW 50-day avg (${slow}) — downtrend starting"
+            rsi_label = "neutral"
     else:
-        if fast and slow:
-            position = "above" if fast > slow else "below"
-            trend    = "uptrend in place" if fast > slow else "downtrend in place"
-            ma_line  = f"20-day avg (${fast}) is {position} 50-day avg (${slow}) — {trend}"
+        rsi_label = "unavailable"
+
+    # ── MA line + actionable reason ────────────────────────────────────────────
+    if fast and slow:
+        if analysis.get("ma_crossover"):
+            if analysis.get("crossover_dir") == "UP":
+                ma_line   = f"20MA (${fast}) just crossed ABOVE 50MA (${slow}) — uptrend starting 🟢"
+                ma_reason = "Golden cross today — trend confirmed"
+            else:
+                ma_line   = f"20MA (${fast}) just crossed BELOW 50MA (${slow}) — downtrend starting 🔴"
+                ma_reason = "Death cross today — downtrend starting"
+        elif fast > slow:
+            gap       = round(fast - slow, 2)
+            ma_line   = f"20MA (${fast}) above 50MA (${slow}) — uptrend ✅  (gap: +${gap})"
+            ma_reason = "Uptrend confirmed"
         else:
-            ma_line = "MA data unavailable"
-
-    rsi = analysis["rsi"]
-    if rsi and rsi < 30:
-        rsi_label = "oversold — potential buy zone"
-    elif rsi and rsi > 70:
-        rsi_label = "overbought — potential sell zone"
+            gap       = round(slow - fast, 2)
+            needed    = round((slow - fast) / slow * 100, 1)
+            ma_line   = f"20MA (${fast}) below 50MA (${slow}) — downtrend ⚠️  (gap: -${gap})"
+            ma_reason = (
+                f"20MA needs to rise ~{needed}% to cross above 50MA — "
+                f"wait for uptrend confirmation before buying"
+            )
     else:
-        rsi_label = "neutral"
+        ma_line   = "MA data unavailable"
+        ma_reason = "MA unavailable"
 
-    last_candle = analysis.get("last_candle", "unknown")
-    is_realtime  = analysis.get("realtime", False)
+    # ── Earnings section ───────────────────────────────────────────────────────
+    eps     = analysis.get("eps_growth_pct")
+    rev     = analysis.get("revenue_growth_pct")
+    earn_dt = analysis.get("next_earnings_date")
+
+    earnings_lines = []
+    if eps is not None:
+        sign = "+" if eps >= 0 else ""
+        icon = "✅" if eps > 0 else "⚠️"
+        earnings_lines.append(f"EPS growth (YoY):  {sign}{eps}%  {icon}")
+    if rev is not None:
+        sign = "+" if rev >= 0 else ""
+        icon = "✅" if rev > 0 else "⚠️"
+        earnings_lines.append(f"Revenue growth:    {sign}{rev}%  {icon}")
+    if earn_dt:
+        earnings_lines.append(f"Next earnings:     {earn_dt}")
+
+    # ── Price / source ─────────────────────────────────────────────────────────
+    last_candle  = analysis.get("last_candle", "unknown")
     price_source = analysis.get("price_source")
-    if price_source == "ibkr":
-        price_note = "15-min delayed price (IBKR)"
-    elif price_source == "alpaca":
-        price_note = "15-min delayed price (Alpaca)"
+    if price_source == "alpaca":
+        price_note = "15-min delayed (Alpaca)"
+    elif price_source == "ibkr":
+        price_note = "15-min delayed (IBKR)"
     else:
-        price_note = f"delayed price from {last_candle}"
-    data_note   = f"RSI & MA based on closing data from {last_candle} (updates after US market close ~11 PM Finnish / 4 PM ET)"
+        price_note = f"close from {last_candle}"
 
-    signal_label = analysis["signal"] if analysis["signal"] != "NONE" else None
-    company_name = analysis.get("company_name")
-    ticker_part  = f"*{analysis['ticker']}*" + (f" ({company_name})" if company_name else "")
-    title        = f"{ticker_part} — {signal_label}" if signal_label else ticker_part
-
-    return (
-        f"{title}\n"
-        f"\n"
-        f"Price:  ${analysis['price']}  _({price_note})_\n"
-        f"RSI:    {rsi}  ({rsi_label})\n"
-        f"\n"
-        f"MA:     {ma_line}\n"
-        f"\n"
-        f"Signal: {analysis['signal']}\n"
-        f"Reason: {analysis['reason']}\n"
-        f"\n"
-        f"🕓 {dual_time()}\n"
-        f"_{data_note}_"
+    data_note = (
+        f"RSI & MA from closing data {last_candle} "
+        f"(updates after US close ~11 PM Finnish)"
     )
+
+    company_name = analysis.get("company_name")
+    ticker_part  = f"*{analysis['ticker']}*" + (f" — {company_name}" if company_name else "")
+    signal       = analysis.get("signal", "NONE")
+    signal_icon  = {"BUY": "🟢", "SELL": "🔴"}.get(signal, "⚪")
+    title        = f"{ticker_part}"
+
+    lines = [
+        title,
+        "",
+        f"Price:   ${analysis.get('price')}  _({price_note})_",
+        f"RSI:     {rsi}  ({rsi_label})",
+        "",
+        f"MA:      {ma_line}",
+        f"         _{ma_reason}_",
+    ]
+
+    if earnings_lines:
+        lines += ["", "*Fundamentals (last quarter vs same quarter last year):*"]
+        lines += earnings_lines
+
+    lines += [
+        "",
+        f"Signal:  {signal_icon} {signal}",
+        f"Reason:  {analysis.get('reason', '')}",
+        "",
+        f"🕓 {dual_time()}",
+        f"_{data_note}_",
+    ]
+
+    return "\n".join(lines)
 
 
 def format_summary_message(fired: List[dict]) -> str:
