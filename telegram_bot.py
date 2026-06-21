@@ -205,24 +205,76 @@ async def post_summary(bot: Bot, fired: List[dict]) -> None:
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _is_rate_limited(update.effective_user.id, "watchlist"):
         return
-    import scanner
+
+    import scanner as sc
+
+    args = context.args or []
+    mode = args[0].lower() if args else None
+
+    # ── /watchlist low or /watchlist high — live RSI scan ────────────────────
+    if mode in ("low", "high"):
+        label = "oversold (buy candidates)" if mode == "low" else "overbought (extended)"
+        await update.message.reply_text(
+            f"Scanning all S&P 500 stocks for {label}... (~60s)"
+        )
+        stocks = sc.run_watchlist_scan(mode=mode)
+        if not stocks:
+            await update.message.reply_text("Scan returned no results. Try again later.")
+            return
+
+        top = stocks[:50]
+        mode_header = "OVERSOLD — Low RSI (buy candidates)" if mode == "low" \
+                      else "OVERBOUGHT — High RSI (extended)"
+        lines = [f"*{mode_header}*", f"_{datetime.now(config.TIMEZONE).strftime('%a %b %-d, %H:%M')}_", ""]
+
+        for i, s in enumerate(top, 1):
+            rsi = s["rsi"]
+            if rsi <= config.RSI_BUY_THRESHOLD:
+                rsi_tag = f"RSI {rsi} 🟢"
+            elif rsi >= config.RSI_SELL_THRESHOLD:
+                rsi_tag = f"RSI {rsi} 🔴"
+            else:
+                rsi_tag = f"RSI {rsi}"
+            mom = s["momentum_pct"]
+            mom_str = f"{'+' if mom >= 0 else ''}{mom}%"
+            lines.append(f"{i}. *{s['ticker']}*  {rsi_tag}  |  5d: {mom_str}  |  Vol {s['volume_ratio']}×")
+
+        lines += ["", "_/watchlist low — oversold   /watchlist high — overbought_"]
+        text = "\n".join(lines)
+
+        # Telegram message limit is 4096 chars — split if needed
+        if len(text) > 4000:
+            text = "\n".join(lines[:52])  # header + 50 rows + footer
+
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ── /watchlist (no args) — show cached daily list with size picker ────────
     stocks = wl.get_watchlist_with_names()
     if not stocks:
         now = datetime.now(config.TIMEZONE)
         if now.hour >= 16:
-            await update.message.reply_text("No watchlist found — running scan now, please wait...")
-            top_stocks = scanner.run_morning_scan()
+            await update.message.reply_text(
+                "No watchlist yet today — running scan now (~60s)..."
+            )
+            top_stocks = sc.run_morning_scan()
             if top_stocks:
                 wl.save_watchlist(top_stocks)
                 stocks = wl.get_watchlist_with_names()
             else:
-                await update.message.reply_text("Scan failed. Please try again later.")
+                await update.message.reply_text("Scan failed. Try again later.")
                 return
         else:
-            await update.message.reply_text("No watchlist available yet. Check back after 4:00 PM Finnish time.")
+            await update.message.reply_text(
+                "No watchlist yet — check back after 4:00 PM Finnish.\n"
+                "Or run a live scan now:\n"
+                "  /watchlist low  — oversold stocks (buy candidates)\n"
+                "  /watchlist high — overbought stocks"
+            )
             return
     await update.message.reply_text(
-        f"How many stocks do you want to see? (Total available: {len(stocks)})",
+        f"How many stocks do you want to see? (Total available: {len(stocks)})\n"
+        f"Or use /watchlist low / /watchlist high for a live RSI scan.",
         reply_markup=_watchlist_size_keyboard(),
     )
 
@@ -1011,13 +1063,13 @@ def build_application(token: str) -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("health", cmd_health))
 
-    # ── Trading commands ──────────────────────────────────────────────────────
-    app.add_handler(CommandHandler("positions", cmd_positions))
-    app.add_handler(CommandHandler("trades",    cmd_trades))
-    app.add_handler(CommandHandler("pause",     cmd_pause))
-    app.add_handler(CommandHandler("resume",    cmd_resume))
-    app.add_handler(CommandHandler("stopall",   cmd_stopall_confirm))
-    app.add_handler(CommandHandler("report",    cmd_report))
+    # ── Trading commands (disabled — watchlist-only mode) ────────────────────
+    # app.add_handler(CommandHandler("positions", cmd_positions))
+    # app.add_handler(CommandHandler("trades",    cmd_trades))
+    # app.add_handler(CommandHandler("pause",     cmd_pause))
+    # app.add_handler(CommandHandler("resume",    cmd_resume))
+    # app.add_handler(CommandHandler("stopall",   cmd_stopall_confirm))
+    # app.add_handler(CommandHandler("report",    cmd_report))
     app.add_handler(CommandHandler("testrun",   cmd_testrun))
 
     # Text search input (for /signal and /chart search mode)
@@ -1031,21 +1083,14 @@ def build_application(token: str) -> Application:
 async def register_commands(bot: Bot) -> None:
     try:
         await bot.set_my_commands([
-            BotCommand("watchlist",        "Show today's auto-generated top stocks"),
+            BotCommand("watchlist",        "Top stocks — /watchlist low or /watchlist high"),
             BotCommand("signal",           "Check a stock — RSI & trend"),
             BotCommand("chart",            "Get a price chart"),
             BotCommand("mywatchlist",      "Manage your custom watchlist"),
             BotCommand("scanmywatchlist",  "Scan your custom watchlist for signals"),
-            BotCommand("positions",        "Show open Alpaca positions"),
-            BotCommand("trades",           "Show trade history & stats"),
-            BotCommand("pause",            "Pause auto-trading"),
-            BotCommand("resume",           "Resume auto-trading"),
-            BotCommand("stopall",          "Emergency: cancel all + liquidate"),
-            BotCommand("report",           "Weekly report  |  /report all for full history"),
-            BotCommand("testrun",          "Trigger a scheduled job now (testing)"),
-            BotCommand("portfolio",        "Show your IBKR positions & P&L"),
             BotCommand("status",           "Bot status & schedule"),
-            BotCommand("health",           "Check Alpaca / yfinance connectivity"),
+            BotCommand("health",           "Check connectivity"),
+            BotCommand("testrun",          "Trigger a job now (testing)"),
         ])
         logger.info("Command menu registered with Telegram.")
     except Exception as e:

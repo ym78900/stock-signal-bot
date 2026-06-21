@@ -1,3 +1,14 @@
+"""
+main.py — Watchlist-only bot.
+
+Runs one daily job:
+  16:00 Finnish (9:00 AM ET) — scan all S&P 500 stocks, rank by RSI
+  buy-readiness, post the watchlist to Telegram.
+
+No automated trading. Use /watchlist low or /watchlist high in Telegram
+to pull the list on demand at any time.
+"""
+
 import asyncio
 import logging
 import os
@@ -7,12 +18,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
 import scanner
-import signals as sig
 import watchlist as wl
 import telegram_bot as tbot
-import trade_logger as tlog
-import trader
-import reporter
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -27,8 +34,9 @@ logger = logging.getLogger(__name__)
 
 async def job_morning_scan(bot):
     """
-    Job 1 — 4:00 PM Finnish / 9:00 AM ET.
-    Scans all S&P 500 stocks, saves the top 50, posts watchlist at 4:20 PM.
+    16:00 Finnish / 9:00 AM ET.
+    Scans all S&P 500 stocks, ranks by buy-readiness (RSI oversold first),
+    saves the top 50, posts the watchlist to Telegram at 16:20.
     """
     logger.info("=== Morning scan started ===")
     top_stocks = scanner.run_morning_scan()
@@ -40,313 +48,6 @@ async def job_morning_scan(bot):
     await asyncio.sleep(20 * 60)
     await tbot.post_watchlist(bot, top_stocks)
     logger.info("=== Morning scan complete ===")
-
-
-async def job_execute_trades(bot):
-    """
-    Job 2 — 4:25 PM Finnish / 9:25 AM ET (5 min before market open).
-    Two-phase execution:
-
-    Phase 1 (9:25 AM ET): Place simple market buys for all queued trades.
-      Orders queue pre-market and fill at/near the 9:30 AM ET open.
-
-    Phase 2 (~9:32 AM ET): Poll Alpaca for real fill prices, then place
-      OCO exits (stop + take-profit) based on the ACTUAL fill — not yesterday's
-      close estimate. This ensures stop/target distances are always correct
-      regardless of overnight gaps.
-    """
-    logger.info("=== Execute pending trades started ===")
-
-    if tlog.is_paused():
-        msg = "Auto-trading is PAUSED — skipping execution. Use /resume to restart."
-        logger.info(msg)
-        await tbot.post_alert(bot, msg)
-        return
-
-    pending = tlog.load_pending_trades()
-    if not pending:
-        logger.info("No pending trades to execute.")
-        return
-
-    # Market-wide circuit breakers (run once for all trades)
-    ok, reason = trader.run_circuit_breakers()
-    if not ok:
-        msg = f"Circuit breaker: {reason}\nQueued trades cancelled: {[t['ticker'] for t in pending]}"
-        logger.warning(msg)
-        await tbot.post_alert(bot, msg)
-        tlog.clear_pending_trades()
-        return
-
-    open_count = trader.get_open_position_count()
-    equity     = trader.get_account_equity()
-    if equity <= 0:
-        logger.error("Could not fetch account equity — aborting execution.")
-        return
-
-    # ── Phase 1: place all market buys ───────────────────────────────────────
-    pending_fills = []   # trades waiting for fill confirmation
-    skipped       = []
-
-    for trade in pending:
-        ticker      = trade["ticker"]
-        close_price = float(trade["close_price"])
-        atr         = float(trade["atr"])
-        signal_date = trade["signal_date"]
-
-        if open_count >= config.MAX_OPEN_POSITIONS:
-            skipped.append(f"{ticker} (max positions reached)")
-            continue
-
-        consec = tlog.get_consecutive_losses()
-        if consec >= config.CONSECUTIVE_LOSS_LIMIT:
-            msg = (f"Consecutive loss limit reached ({consec}/{config.CONSECUTIVE_LOSS_LIMIT}). "
-                   f"Auto-trading PAUSED. Use /resume to restart.")
-            tlog.pause_trading(msg)
-            await tbot.post_alert(bot, msg)
-            break
-
-        earn_safe, earn_date = trader.check_earnings(ticker)
-        if not earn_safe:
-            skipped.append(f"{ticker} (earnings {earn_date})")
-            continue
-
-        from signals import calculate_position_size
-        qty = calculate_position_size(
-            entry_price     = close_price,
-            atr             = atr,
-            atr_target_mult = config.ATR_TARGET_MULTIPLIER,
-            profit_target   = config.DAILY_PROFIT_TARGET,
-            portfolio_value = equity,
-            hard_cap_pct    = config.MAX_POSITION_PCT_HARD_CAP,
-            min_shares      = config.MIN_SHARES_REQUIRED,
-        )
-
-        if qty == 0:
-            logger.info(f"Skipping {ticker} @ ${close_price:.2f} — too expensive for position cap")
-            skipped.append(f"{ticker} (price too high for position cap)")
-            continue
-
-        # Place market buy (no stop/target yet — will be set after fill)
-        entry_order_id = trader.place_market_buy(ticker, qty)
-        if entry_order_id:
-            tlog.log_order_placed(
-                ticker          = ticker,
-                signal_date     = signal_date,
-                entry_price_est = close_price,
-                stop_price      = None,   # set after fill
-                target_price    = None,   # set after fill
-                qty             = qty,
-                alpaca_order_id = entry_order_id,
-            )
-            tlog.remove_pending_trade(ticker)
-            pending_fills.append({
-                "ticker":   ticker,
-                "qty":      qty,
-                "order_id": entry_order_id,
-                "atr":      atr,
-            })
-            open_count += 1
-        else:
-            skipped.append(f"{ticker} (order failed)")
-
-    if not pending_fills:
-        await tbot.post_execution_summary(bot, [], skipped)
-        logger.info("=== Execute trades complete — 0 placed ===")
-        return
-
-    # ── Phase 2: wait for market open, poll fills, place OCO exits ───────────
-    # Orders placed pre-market fill at the 9:30 AM ET open.
-    # We wait 2 min after open (9:32 AM ET) then poll every 30s for up to 3 min.
-    logger.info(f"Waiting 2 min for market open to fill {len(pending_fills)} order(s)...")
-    await asyncio.sleep(2 * 60)
-
-    placed       = []
-    fill_errors  = []
-
-    for entry in pending_fills:
-        ticker = entry["ticker"]
-        atr    = entry["atr"]
-
-        # Poll for fill — 6 attempts × 30s = 3 min max wait per order
-        fill_price = None
-        for attempt in range(6):
-            fill_price = trader.get_order_fill_price(entry["order_id"])
-            if fill_price:
-                logger.info(f"{ticker} filled @ ${fill_price}")
-                break
-            if attempt < 5:
-                logger.info(f"{ticker}: not yet filled (attempt {attempt+1}/6) — waiting 30s...")
-                await asyncio.sleep(30)
-
-        if not fill_price:
-            # Order didn't fill — cancel it to avoid a surprise fill later
-            trader.cancel_order(entry["order_id"])
-            msg = (f"⚠️ {ticker}: market buy NOT filled within 3 min of open — "
-                   f"order cancelled. Check Alpaca manually.")
-            logger.warning(msg)
-            await tbot.post_alert(bot, msg)
-            fill_errors.append(f"{ticker} (fill timeout — cancelled)")
-            continue
-
-        # Calculate trailing distance from real fill price
-        trail_price  = round(atr * config.ATR_STOP_MULTIPLIER, 2)
-
-        # Place trailing stop exit — Alpaca manages the trail server-side
-        exit_order_id = trader.place_trailing_stop_exit(ticker, entry["qty"], trail_price)
-        if exit_order_id:
-            tlog.update_trade_after_fill(
-                entry_order_id = entry["order_id"],
-                fill_price     = fill_price,
-                stop_price     = round(fill_price - trail_price, 2),   # initial stop level
-                target_price   = None,                                  # no fixed target
-                oco_order_id   = exit_order_id,
-            )
-            placed.append({
-                "ticker": ticker,
-                "qty":    entry["qty"],
-                "fill":   fill_price,
-                "stop":   round(fill_price - trail_price, 2),
-                "target": "trailing",
-            })
-        else:
-            # Fill happened but trailing stop order failed — position is open with NO protection!
-            msg = (f"🚨 {ticker}: filled @ ${fill_price} but trailing stop order FAILED — "
-                   f"position has no stop! Cancel manually in Alpaca.")
-            logger.error(msg)
-            await tbot.post_alert(bot, msg)
-            fill_errors.append(f"{ticker} (trailing stop failed — MANUAL ACTION NEEDED)")
-
-    await tbot.post_execution_summary(bot, placed, skipped + fill_errors)
-    logger.info(
-        f"=== Execute trades complete — {len(placed)} filled+OCO placed, "
-        f"{len(skipped)} skipped, {len(fill_errors)} errors ==="
-    )
-
-
-async def job_signal_check(bot):
-    """
-    Job 3 — 11:15 PM Finnish / 4:15 PM ET (after market close).
-    Runs auto-scan on all 503 S&P 500 tickers and queues any BUY signals
-    for execution at next morning's open.
-    """
-    logger.info("=== Signal check started ===")
-
-    # ── Auto-trading scan (all 503 tickers) ──────────────────────────────────
-    if tlog.is_paused():
-        logger.info("Auto-trading paused — skipping auto-scan.")
-        logger.info("=== Signal check complete ===")
-        return
-
-    logger.info("Running auto-scan on all S&P 500 tickers...")
-    buy_signals = scanner.run_auto_scan()
-
-    if not buy_signals:
-        logger.info("Auto-scan: no BUY signals found tonight.")
-        await tbot.post_alert(bot, "Auto-scan complete — no BUY signals tonight.")
-    else:
-        for sig_data in buy_signals:
-            tlog.queue_pending_trade(
-                ticker       = sig_data["ticker"],
-                signal_date  = sig_data["signal_date"],
-                close_price  = sig_data["close_price"],
-                atr          = sig_data["atr"],
-                rsi          = sig_data["rsi"],
-                volume_ratio = sig_data["volume_ratio"],
-            )
-        tickers = [s["ticker"] for s in buy_signals]
-        await tbot.post_queued_trades(bot, buy_signals)
-        logger.info(f"Queued {len(buy_signals)} trade(s): {tickers}")
-
-    logger.info("=== Signal check complete ===")
-
-
-async def job_weekly_report(bot):
-    """
-    Job 5 — Sunday 8:00 PM Finnish.
-    Posts the weekly performance report to the Telegram channel.
-    """
-    logger.info("=== Weekly report started ===")
-    try:
-        text = reporter.build_weekly_report()
-        await tbot.post_alert(bot, text)
-        logger.info("=== Weekly report posted ===")
-    except Exception as e:
-        logger.error(f"Weekly report failed: {e}")
-
-
-async def job_monitor_positions(bot):
-    """
-    Job 4 — every 15 min during market hours (4:30 PM – 11:00 PM Finnish).
-    1. Checks if any trailing stop orders have been filled (exit detected).
-    2. Enforces MAX_HOLD_DAYS: cancels trailing stop + market-sells any position
-       held longer than the max hold period (backtest used 60 days).
-    """
-    from datetime import date, timedelta
-    open_trades = tlog.get_open_trades()
-    if not open_trades:
-        return
-
-    tracked_ids = [t["alpaca_order_id"] for t in open_trades if t.get("alpaca_order_id")]
-
-    # ── Max hold day enforcement ──────────────────────────────────────────────
-    today = date.today()
-    for trade in open_trades:
-        try:
-            entry_date = date.fromisoformat(str(trade.get("entry_date", ""))[:10])
-        except Exception:
-            continue
-        days_held = (today - entry_date).days
-        if days_held >= config.MAX_HOLD_DAYS:
-            ticker   = trade["ticker"]
-            order_id = trade.get("alpaca_order_id", "")
-            logger.info(f"{ticker}: max hold {days_held}d reached — closing position")
-            # Cancel the trailing stop order so it doesn't conflict with market sell
-            if order_id:
-                trader.cancel_order(order_id)
-            # Market sell to close the position
-            exit_price = None
-            try:
-                from alpaca.trading.requests import MarketOrderRequest
-                from alpaca.trading.enums import OrderSide, TimeInForce
-                req = MarketOrderRequest(
-                    symbol        = ticker,
-                    qty           = int(trade["qty"]),
-                    side          = OrderSide.SELL,
-                    time_in_force = TimeInForce.DAY,
-                )
-                sell_order = trader._trading_client().submit_order(req)
-                # Poll briefly for the fill price so we can log it accurately
-                import asyncio as _asyncio
-                for _ in range(6):
-                    fp = trader.get_order_fill_price(str(sell_order.id))
-                    if fp:
-                        exit_price = fp
-                        break
-                    await _asyncio.sleep(10)
-                msg = f"⏱ {ticker}: max hold ({days_held} days) reached — position closed at market."
-                await tbot.post_alert(bot, msg)
-            except Exception as e:
-                logger.error(f"Max hold market sell failed for {ticker}: {e}")
-            # Mark the trade closed in trades.csv so the monitor stops tracking it
-            tlog.mark_trade_closed(
-                alpaca_order_id = order_id or trade.get("alpaca_order_id", ""),
-                exit_price      = exit_price or 0.0,
-                exit_date       = str(today),
-                exit_reason     = "max_hold",
-            )
-
-    # ── Check for trailing stop fills ─────────────────────────────────────────
-    closed = trader.get_closed_bracket_legs(tracked_ids)
-
-    for c in closed:
-        updated = tlog.mark_trade_closed(
-            alpaca_order_id = c["alpaca_order_id"],
-            exit_price      = c["exit_price"],
-            exit_date       = c["exit_date"],
-            exit_reason     = c["exit_reason"],
-        )
-        if updated:
-            await tbot.post_trade_closed(bot, updated)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -364,65 +65,28 @@ async def main():
         logger.error("TELEGRAM_CHANNEL_ID is not set in .env")
         return
 
-    logger.info("Starting Stock Signal Bot...")
-    logger.info(f"Trading mode: {'PAPER' if config.PAPER_TRADING else 'LIVE'} | {config.TRADING_MODE}")
-
-    # Pre-load Alpaca asset cache
-    logger.info("Loading asset cache from Alpaca...")
-    sig.load_asset_cache()
+    logger.info("Starting Stock Watchlist Bot...")
 
     app = tbot.build_application(token)
     bot = app.bot
 
-    # Register job functions so /testrun can invoke them on demand
+    # Register scan job so /testrun scan still works
     app.bot_data["test_jobs"] = {
-        "scan":    job_morning_scan,
-        "execute": job_execute_trades,
-        "signal":  job_signal_check,
-        "monitor": job_monitor_positions,
-        "report":  job_weekly_report,
+        "scan": job_morning_scan,
     }
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
     scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
-
     scheduler.add_job(
         job_morning_scan, trigger="cron",
         hour=config.MORNING_SCAN_HOUR, minute=config.MORNING_SCAN_MINUTE,
         args=[bot], id="morning_scan", misfire_grace_time=300,
     )
-    scheduler.add_job(
-        job_execute_trades, trigger="cron",
-        hour=config.EXECUTE_TRADES_HOUR, minute=config.EXECUTE_TRADES_MINUTE,
-        args=[bot], id="execute_trades", misfire_grace_time=120,
-    )
-    scheduler.add_job(
-        job_signal_check, trigger="cron",
-        hour=config.SIGNAL_CHECK_HOUR, minute=config.SIGNAL_CHECK_MINUTE,
-        args=[bot], id="signal_check", misfire_grace_time=300,
-    )
-    # Monitor positions every 15 min from 4:30 PM to 11:00 PM Finnish
-    # hour="16-23" covers full market session (closes 23:00 Finnish / 4:00 PM ET)
-    scheduler.add_job(
-        job_monitor_positions, trigger="cron",
-        hour="16-23", minute=f"*/{config.MONITOR_INTERVAL_MINUTES}",
-        args=[bot], id="monitor_positions", misfire_grace_time=60,
-    )
-    # Weekly report — Sunday 8:00 PM Finnish
-    scheduler.add_job(
-        job_weekly_report, trigger="cron",
-        day_of_week="sun", hour=20, minute=0,
-        args=[bot], id="weekly_report", misfire_grace_time=600,
-    )
-
     scheduler.start()
     logger.info(
         f"Scheduler running:\n"
-        f"  Morning scan:      {config.MORNING_SCAN_HOUR:02d}:{config.MORNING_SCAN_MINUTE:02d} Finnish\n"
-        f"  Execute trades:    {config.EXECUTE_TRADES_HOUR:02d}:{config.EXECUTE_TRADES_MINUTE:02d} Finnish  (9:25 AM ET)\n"
-        f"  Signal check:      {config.SIGNAL_CHECK_HOUR:02d}:{config.SIGNAL_CHECK_MINUTE:02d} Finnish  (4:15 PM ET)\n"
-        f"  Position monitor:  every {config.MONITOR_INTERVAL_MINUTES} min  16:30–23:00 Finnish\n"
-        f"  Weekly report:     Sunday 20:00 Finnish"
+        f"  Morning scan: {config.MORNING_SCAN_HOUR:02d}:{config.MORNING_SCAN_MINUTE:02d} Finnish"
+        f"  (posts watchlist at {config.MORNING_SCAN_HOUR:02d}:20)"
     )
 
     # ── Start Telegram bot polling ─────────────────────────────────────────────

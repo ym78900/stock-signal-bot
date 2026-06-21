@@ -385,6 +385,45 @@ def run_morning_scan() -> List[dict]:
     return top
 
 
+def run_watchlist_scan(mode: str = "low") -> List[dict]:
+    """
+    On-demand watchlist scan with a sort mode:
+
+      mode="low"  — oversold stocks ranked by LOWEST RSI first.
+                    These are buy candidates (RSI < 50, ideally < 38).
+      mode="high" — overbought stocks ranked by HIGHEST RSI first.
+                    These are extended/potentially stretched stocks (RSI > 50).
+
+    Returns all scored stocks (no top-N cap) sorted by the chosen direction,
+    so the caller can decide how many to show.
+    """
+    tickers = get_extended_tickers()
+    if not tickers:
+        logger.error("No tickers available — aborting scan.")
+        return []
+
+    data = fetch_data(tickers)
+    if not data:
+        logger.error("No data returned from yfinance — aborting scan.")
+        return []
+
+    scores = []
+    for ticker, df in data.items():
+        result = _score_stock(ticker, df)
+        if result:
+            scores.append(result)
+
+    if mode == "low":
+        # Lowest RSI first — most oversold / best buy candidates at the top
+        scores.sort(key=lambda x: x["rsi"])
+    else:
+        # Highest RSI first — most overbought / most extended at the top
+        scores.sort(key=lambda x: x["rsi"], reverse=True)
+
+    logger.info(f"Watchlist scan ({mode}): {len(scores)} stocks scored.")
+    return scores
+
+
 # ── Auto-trading scan (all 503 tickers, used at 11:15 PM) ────────────────────
 
 def run_auto_scan() -> list:
