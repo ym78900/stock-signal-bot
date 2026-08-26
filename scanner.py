@@ -1,7 +1,7 @@
 import logging
 import os
 import pickle
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, List, Dict
 import pandas as pd
@@ -206,6 +206,28 @@ def get_sp500_tickers() -> List[str]:
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
 
+def _is_market_hours(now_et: datetime) -> bool:
+    if now_et.weekday() >= 5:  # Saturday/Sunday
+        return False
+    open_t  = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_t <= now_et <= close_t
+
+
+def _strip_incomplete_session(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop the last row if it's today's still-forming session (market is
+    currently open). Its volume is partial, which would otherwise make
+    volume_ratio look artificially low for every stock scanned mid-session.
+    """
+    if df.empty:
+        return df
+    now_et = datetime.now(config.TIMEZONE_ET)
+    if pd.Timestamp(df.index[-1]).date() == now_et.date() and _is_market_hours(now_et):
+        return df.iloc[:-1]
+    return df
+
+
 def fetch_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
     """
     Download daily OHLCV data for all tickers in one bulk request.
@@ -246,6 +268,7 @@ def fetch_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
                 df.columns = df.columns.get_level_values(0)
 
             df.dropna(how="all", inplace=True)
+            df = _strip_incomplete_session(df)
 
             # Need at least 55 rows for a reliable 50-day MA
             if len(df) >= 55:
