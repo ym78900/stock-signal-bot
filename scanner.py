@@ -1,4 +1,5 @@
 import logging
+import os
 import pickle
 from datetime import date
 from pathlib import Path
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # ── Daily data cache (reused within the same calendar day) ───────────────────
 
-_DAILY_CACHE_FILE = Path(__file__).parent / "daily_data_cache.pkl"
+_DAILY_CACHE_FILE = Path(os.environ.get("SCAN_CACHE_DIR", Path(__file__).parent)) / "daily_data_cache.pkl"
 
 def _load_daily_cache() -> Optional[Dict[str, pd.DataFrame]]:
     """Return today's cached data if it exists, else None."""

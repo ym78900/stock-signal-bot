@@ -1,6 +1,6 @@
 """
 Stock Signal Bot - HTTP API Server
-Runs alongside the Telegram bot, exposes bot data as JSON endpoints.
+Serves stock scan/signal data to the iOS app as JSON endpoints, on demand.
 Auth: x-app-password header (validated against STOCK_API_PASSWORD env var).
 """
 import math
@@ -14,7 +14,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 import config
-import watchlist as wl
 import signals as sig
 import scanner as sc
 
@@ -53,7 +52,7 @@ def _sanitize(obj):
 @app.get("/watchlist")
 def get_watchlist(x_app_password: Optional[str] = Header(default=None)):
     _auth(x_app_password)
-    stocks = wl.get_watchlist_with_names()
+    stocks = sc.run_morning_scan()
     scan_date = datetime.now(config.TIMEZONE).strftime("%a %b %-d")
     scan_time = datetime.now(config.TIMEZONE).strftime("%-I:%M %p")
     return _sanitize({

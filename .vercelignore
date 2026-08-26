@@ -1,0 +1,12 @@
+*.pkl
+*.csv
+*.json
+!vercel.json
+!package.json
+__pycache__/
+*.pyc
+.git/
+.env
+.env.local
+backtest_*
+intraday_*
