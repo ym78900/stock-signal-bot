@@ -6,6 +6,7 @@ Auth: x-app-password header (validated against STOCK_API_PASSWORD env var).
 import math
 import os
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -55,10 +56,22 @@ def _sanitize(obj):
     return obj
 
 
+# Bounded, not unbounded — the VM is a 1GB e2-micro, and yfinance's session/crumb
+# handling degrades under heavy concurrency, so a handful of workers is the sweet
+# spot between "faster than one-at-a-time" and "doesn't take the box down again".
+_ENRICH_MAX_WORKERS = 4
+
+
 def _enrich_top(stocks: list, n: int = 10) -> None:
     """Adds AI fields to the top N stocks in place — bounds OpenAI cost on a 50-stock scan."""
-    for stock in stocks[:n]:
-        stock.update(ai.get_ai_enrichment(stock["ticker"], stock.get("company_name"), stock.get("rsi")))
+    top = stocks[:n]
+    with ThreadPoolExecutor(max_workers=_ENRICH_MAX_WORKERS) as pool:
+        fields = pool.map(
+            lambda s: ai.get_ai_enrichment(s["ticker"], s.get("company_name"), s.get("rsi")),
+            top,
+        )
+        for stock, ai_fields in zip(top, fields):
+            stock.update(ai_fields)
 
 
 @app.get("/watchlist")
@@ -159,11 +172,8 @@ def portfolio_signals(
     """Signals for the tickers the user actually holds — not limited to the S&P 500
     screener universe, since each is looked up individually."""
     _auth(x_app_password)
-    results = []
-    for ticker in body.tickers:
-        result = _build_signal(ticker)
-        if result is not None:
-            results.append(result)
+    with ThreadPoolExecutor(max_workers=_ENRICH_MAX_WORKERS) as pool:
+        results = [r for r in pool.map(_build_signal, body.tickers) if r is not None]
     return _sanitize({"signals": results})
 
 
