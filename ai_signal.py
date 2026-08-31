@@ -14,6 +14,9 @@ from typing import Optional
 
 from openai import OpenAI
 
+import config
+import finviz_source
+
 _CACHE_FILE = Path(os.environ.get("SCAN_CACHE_DIR", Path(__file__).parent)) / "ai_sentiment_cache.json"
 
 _MODEL = "gpt-4o-mini"
@@ -78,3 +81,59 @@ def analyze_sentiment(ticker: str, company_name: Optional[str], headlines: list[
     cache[cache_key] = result
     _save_cache(cache)
     return result
+
+
+def build_verdict(rsi: Optional[float], sentiment: Optional[dict]) -> dict:
+    """Combine the existing RSI signal with LLM sentiment, per the AI signal engine's
+    decision matrix. This overlays signals.analyse()'s rule-based `signal` field —
+    it doesn't replace it."""
+    if rsi is None or sentiment is None:
+        return {"ai_verdict": None, "ai_reasoning": None}
+
+    score = sentiment.get("sentiment_score")
+    reasoning = sentiment.get("reasoning_summary")
+
+    if rsi < config.RSI_BUY_THRESHOLD:
+        if sentiment.get("is_permanent_damage") or (score is not None and score < -0.5):
+            verdict = "AVOID"
+        elif score is not None and score > 0.4:
+            verdict = "STRONG BUY"
+        else:
+            verdict = "BUY"
+    elif rsi > config.RSI_SELL_THRESHOLD:
+        if score is not None and score < -0.4:
+            verdict = "STRONG SELL"
+        elif score is not None and score > 0.5:
+            verdict = "HOLD"
+        else:
+            verdict = "SELL"
+    else:
+        verdict = "HOLD"
+
+    return {"ai_verdict": verdict, "ai_reasoning": reasoning}
+
+
+def get_ai_enrichment(ticker: str, company_name: Optional[str], rsi: Optional[float]) -> dict:
+    """Fetch headlines, run sentiment analysis, and build the composite verdict.
+    Never raises — returns all-None fields on any failure so it can't break the
+    base RSI/MA signal it's layered on top of."""
+    defaults = {
+        "sentiment_score": None,
+        "confidence_score": None,
+        "catalyst_type": None,
+        "ai_verdict": None,
+        "ai_reasoning": None,
+    }
+    try:
+        headlines = finviz_source.fetch_finviz_news(ticker)
+        sentiment = analyze_sentiment(ticker, company_name, headlines)
+        if sentiment is None:
+            return defaults
+        return {
+            "sentiment_score": sentiment.get("sentiment_score"),
+            "confidence_score": sentiment.get("confidence_score"),
+            "catalyst_type": sentiment.get("catalyst_type"),
+            **build_verdict(rsi, sentiment),
+        }
+    except Exception:
+        return defaults

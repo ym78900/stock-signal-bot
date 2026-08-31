@@ -11,8 +11,10 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import uvicorn
 
+import ai_signal as ai
 import config
 import signals as sig
 import scanner as sc
@@ -24,9 +26,13 @@ app = FastAPI(title="Stock Signal Bot API", docs_url=None, redoc_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+class PortfolioSignalsRequest(BaseModel):
+    tickers: list[str]
 
 _API_PASSWORD = os.environ.get("STOCK_API_PASSWORD", "")
 
@@ -49,10 +55,17 @@ def _sanitize(obj):
     return obj
 
 
+def _enrich_top(stocks: list, n: int = 10) -> None:
+    """Adds AI fields to the top N stocks in place — bounds OpenAI cost on a 50-stock scan."""
+    for stock in stocks[:n]:
+        stock.update(ai.get_ai_enrichment(stock["ticker"], stock.get("company_name"), stock.get("rsi")))
+
+
 @app.get("/watchlist")
 def get_watchlist(x_app_password: Optional[str] = Header(default=None)):
     _auth(x_app_password)
     stocks = sc.run_morning_scan()
+    _enrich_top(stocks)
     scan_date = datetime.now(config.TIMEZONE).strftime("%a %b %-d")
     scan_time = datetime.now(config.TIMEZONE).strftime("%-I:%M %p")
     return _sanitize({
@@ -67,6 +80,7 @@ def get_watchlist(x_app_password: Optional[str] = Header(default=None)):
 def get_watchlist_low(x_app_password: Optional[str] = Header(default=None)):
     _auth(x_app_password)
     result = sc.run_watchlist_scan(mode="low")
+    _enrich_top(result["results"])
     return _sanitize({
         "mode": "low",
         "label": "Oversold - Buy Candidates",
@@ -83,6 +97,7 @@ def get_watchlist_low(x_app_password: Optional[str] = Header(default=None)):
 def get_watchlist_high(x_app_password: Optional[str] = Header(default=None)):
     _auth(x_app_password)
     result = sc.run_watchlist_scan(mode="high")
+    _enrich_top(result["results"])
     return _sanitize({
         "mode": "high",
         "label": "Overbought - Extended",
@@ -95,19 +110,16 @@ def get_watchlist_high(x_app_password: Optional[str] = Header(default=None)):
     })
 
 
-@app.get("/signal")
-def get_signal(
-    ticker: str = Query(...),
-    x_app_password: Optional[str] = Header(default=None),
-):
-    _auth(x_app_password)
+def _build_signal(ticker: str) -> Optional[dict]:
+    """Shared by /signal and /portfolio/signals — one ticker's full RSI/MA + AI analysis."""
     ticker = ticker.upper().strip()
     df = sig.fetch_ticker_data(ticker)
     if df is None:
-        raise HTTPException(status_code=404, detail=f"Could not fetch data for {ticker}")
+        return None
     analysis = sig.analyse(ticker, df)
     earnings = sig.fetch_earnings_growth(ticker)
-    return _sanitize({
+    ai_fields = ai.get_ai_enrichment(ticker, analysis.get("company_name"), analysis.get("rsi"))
+    return {
         "ticker":             analysis["ticker"],
         "company_name":       analysis.get("company_name"),
         "price":              analysis.get("price"),
@@ -123,7 +135,36 @@ def get_signal(
         "eps_growth_pct":     earnings.get("eps_growth_pct"),
         "revenue_growth_pct": earnings.get("revenue_growth_pct"),
         "next_earnings_date": earnings.get("next_earnings_date"),
-    })
+        **ai_fields,
+    }
+
+
+@app.get("/signal")
+def get_signal(
+    ticker: str = Query(...),
+    x_app_password: Optional[str] = Header(default=None),
+):
+    _auth(x_app_password)
+    result = _build_signal(ticker)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Could not fetch data for {ticker.upper().strip()}")
+    return _sanitize(result)
+
+
+@app.post("/portfolio/signals")
+def portfolio_signals(
+    body: PortfolioSignalsRequest,
+    x_app_password: Optional[str] = Header(default=None),
+):
+    """Signals for the tickers the user actually holds — not limited to the S&P 500
+    screener universe, since each is looked up individually."""
+    _auth(x_app_password)
+    results = []
+    for ticker in body.tickers:
+        result = _build_signal(ticker)
+        if result is not None:
+            results.append(result)
+    return _sanitize({"signals": results})
 
 
 @app.get("/search")
