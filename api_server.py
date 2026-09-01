@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -35,7 +37,12 @@ app.add_middleware(
 class PortfolioSignalsRequest(BaseModel):
     tickers: list[str]
 
+class PortfolioTickersRequest(BaseModel):
+    tickers: list[str]
+
 _API_PASSWORD = os.environ.get("STOCK_API_PASSWORD", "")
+
+_PORTFOLIO_TICKERS_FILE = Path(__file__).parent / "portfolio_tickers.json"
 
 
 def _auth(x_app_password: Optional[str]) -> None:
@@ -175,6 +182,89 @@ def portfolio_signals(
     with ThreadPoolExecutor(max_workers=_ENRICH_MAX_WORKERS) as pool:
         results = [r for r in pool.map(_build_signal, body.tickers) if r is not None]
     return _sanitize({"signals": results})
+
+
+def _build_signal_base(ticker: str) -> Optional[dict]:
+    """RSI/MA/price/earnings only — no AI call. Fast path for the split-request flow."""
+    ticker = ticker.upper().strip()
+    df = sig.fetch_ticker_data(ticker)
+    if df is None:
+        return None
+    analysis = sig.analyse(ticker, df)
+    earnings = sig.fetch_earnings_growth(ticker)
+    return {
+        "ticker":             analysis["ticker"],
+        "company_name":       analysis.get("company_name"),
+        "price":              analysis.get("price"),
+        "price_source":       analysis.get("price_source"),
+        "rsi":                analysis.get("rsi"),
+        "ma_fast":            analysis.get("ma_fast"),
+        "ma_slow":            analysis.get("ma_slow"),
+        "ma_crossover":       analysis.get("ma_crossover"),
+        "crossover_dir":      analysis.get("crossover_dir"),
+        "signal":             analysis.get("signal", "NONE"),
+        "reason":             analysis.get("reason", ""),
+        "last_candle":        analysis.get("last_candle"),
+        "eps_growth_pct":     earnings.get("eps_growth_pct"),
+        "revenue_growth_pct": earnings.get("revenue_growth_pct"),
+        "next_earnings_date": earnings.get("next_earnings_date"),
+        # AI fields absent — iOS merges them in from the /ai call
+        "sentiment_score":    None,
+        "confidence_score":   None,
+        "catalyst_type":      None,
+        "ai_verdict":         None,
+        "ai_reasoning":       None,
+    }
+
+
+def _build_signal_ai(ticker: str) -> Optional[dict]:
+    """AI enrichment only — no market data fetch. Returns None on any failure."""
+    ticker = ticker.upper().strip()
+    try:
+        fields = ai.get_ai_enrichment(ticker, None, None)
+        return {"ticker": ticker, **fields}
+    except Exception:
+        return None
+
+
+@app.post("/portfolio/signals/base")
+def portfolio_signals_base(
+    body: PortfolioSignalsRequest,
+    x_app_password: Optional[str] = Header(default=None),
+):
+    """Fast base signals (RSI/MA/price) with no AI call — returns in ~1-2s."""
+    _auth(x_app_password)
+    with ThreadPoolExecutor(max_workers=_ENRICH_MAX_WORKERS) as pool:
+        results = [r for r in pool.map(_build_signal_base, body.tickers) if r is not None]
+    return _sanitize({"signals": results})
+
+
+@app.post("/portfolio/signals/ai")
+def portfolio_signals_ai(
+    body: PortfolioSignalsRequest,
+    x_app_password: Optional[str] = Header(default=None),
+):
+    """AI-only enrichment fields for the given tickers — hits pre-warmed cache when available."""
+    _auth(x_app_password)
+    with ThreadPoolExecutor(max_workers=_ENRICH_MAX_WORKERS) as pool:
+        results = [r for r in pool.map(_build_signal_ai, body.tickers) if r is not None]
+    return _sanitize({"signals": results})
+
+
+@app.post("/portfolio/tickers")
+def update_portfolio_tickers(
+    body: PortfolioTickersRequest,
+    x_app_password: Optional[str] = Header(default=None),
+):
+    """Called by the iOS app when the user's held tickers change — persists the list
+    so the pre-warm cron job knows which tickers to refresh each morning."""
+    _auth(x_app_password)
+    try:
+        tickers = [t.upper().strip() for t in body.tickers if t.strip()]
+        _PORTFOLIO_TICKERS_FILE.write_text(__import__("json").dumps(sorted(set(tickers))))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not save tickers: {e}")
+    return {"status": "ok", "count": len(tickers)}
 
 
 @app.get("/search")
