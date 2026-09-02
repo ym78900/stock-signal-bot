@@ -11,3 +11,6 @@ __pycache__/
 .DS_Store
 .vercel
 .env*
+
+ai_sentiment_cache.json
+portfolio_tickers.json
