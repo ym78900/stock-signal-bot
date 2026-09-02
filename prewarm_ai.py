@@ -33,6 +33,7 @@ except ImportError:
     pass
 
 import ai_signal as ai
+import signals as sig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,7 +94,19 @@ def prewarm(tickers: list[str]) -> None:
     failed = 0
     for ticker in tickers:
         try:
-            result = ai.get_ai_enrichment(ticker, None, None)
+            # Fetch RSI/company so build_verdict can produce a real verdict —
+            # get_ai_enrichment(..., None, None) always yields ai_verdict=None.
+            rsi = None
+            company_name = None
+            try:
+                df = sig.fetch_ticker_data(ticker)
+                if df is not None:
+                    analysis = sig.analyse(ticker, df)
+                    rsi = analysis.get("rsi")
+                    company_name = analysis.get("company_name")
+            except Exception:
+                pass
+            result = ai.get_ai_enrichment(ticker, company_name, rsi)
             verdict = result.get("ai_verdict") or "no verdict"
             score   = result.get("sentiment_score")
             score_s = f"{score:+.2f}" if score is not None else "n/a"

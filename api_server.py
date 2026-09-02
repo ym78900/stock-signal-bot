@@ -218,10 +218,24 @@ def _build_signal_base(ticker: str) -> Optional[dict]:
 
 
 def _build_signal_ai(ticker: str) -> Optional[dict]:
-    """AI enrichment only — no market data fetch. Returns None on any failure."""
+    """AI enrichment for the split-request flow. Fetches the ticker's RSI so the
+    composite verdict (ai.build_verdict) can be produced — without an RSI the
+    verdict is always None, which is why the app's AI badge never appeared.
+    Returns None on any failure."""
     ticker = ticker.upper().strip()
     try:
-        fields = ai.get_ai_enrichment(ticker, None, None)
+        # Best-effort RSI/company lookup so build_verdict has what it needs.
+        rsi = None
+        company_name = None
+        try:
+            df = sig.fetch_ticker_data(ticker)
+            if df is not None:
+                analysis = sig.analyse(ticker, df)
+                rsi = analysis.get("rsi")
+                company_name = analysis.get("company_name")
+        except Exception:
+            pass
+        fields = ai.get_ai_enrichment(ticker, company_name, rsi)
         return {"ticker": ticker, **fields}
     except Exception:
         return None
