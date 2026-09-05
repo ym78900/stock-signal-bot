@@ -169,7 +169,18 @@ THRESHOLD_DIP_PCT            = 5.0      # buy when price is down this % from N-d
 THRESHOLD_DIP_LOOKBACK_DAYS  = 20       # "N-day high" window
 THRESHOLD_RSI_BUY_MAX        = 40.0     # RSI must be below this to buy
 THRESHOLD_RSI_SELL_MIN       = 65.0     # RSI above this arms/forces an exit too
-THRESHOLD_FEE_PCT_PER_SIDE   = 0.10     # exchange/broker fee % per side (0.10% = 0.001)
+THRESHOLD_FEE_PCT_PER_SIDE   = 0.01     # Alpaca is commission-free for US equities (verified directly
+                                         # against their fee disclosures: "In general, we do not charge
+                                         # a commission for trades"). Only tiny FINRA regulatory fees
+                                         # apply — TAF (sells only, ~$0.000166/share, capped $8.30/trade)
+                                         # and CAT (both sides, fraction of a cent/share) — which round to
+                                         # near-$0 at our position sizes ($175, often fractional shares).
+                                         # Previous 0.10%/side was an unverified generic placeholder that
+                                         # overstated real cost ~10x, making the trailing-exit "arm"
+                                         # threshold wait for more profit than actually necessary
+                                         # (~1.2% vs the ~1.01% this correction implies). 0.01% kept as a
+                                         # small non-zero buffer rather than exactly 0, in case Alpaca's
+                                         # fee-free status or the regulatory fee schedule changes.
 THRESHOLD_MIN_PROFIT_MARGIN_PCT = 1.0   # extra cushion above breakeven-after-fees before arming exit
 THRESHOLD_TRAIL_PCT          = 2.0      # once armed, trail this % below the running peak
 THRESHOLD_HARD_STOP_PCT      = 9.0      # hard stop-loss, independent of RSI/trailing
