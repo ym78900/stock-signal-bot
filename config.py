@@ -179,7 +179,14 @@ THRESHOLD_MIN_AVG_VOLUME     = 200_000  # liquidity floor, same reasoning as swi
 THRESHOLD_PRICE_MIN          = 5.0      # same distress-price floor as swing bot
 THRESHOLD_PRICE_MAX          = 500.0    # simple bot — allow pricier names than the swing bot
 THRESHOLD_MAX_OPEN_POSITIONS = 8
-THRESHOLD_MAX_POSITION_PCT   = 0.12     # 12% of THRESHOLD_ACCOUNT_EQUITY per position, same rationale as swing bot
+THRESHOLD_MAX_POSITION_PCT   = 0.12     # secondary safety cap only — see THRESHOLD_MAX_POSITION_DOLLARS below
+THRESHOLD_MAX_POSITION_DOLLARS = 175.0  # hard $ cap per position — the actual sizing limit in practice.
+                                         # Without this, 12% of a $5k account (~$600/trade) lets expensive
+                                         # stocks eat 3-4x the budget of cheap ones for the same "one signal"
+                                         # (e.g. 8 max positions x $600 = $4,800, almost the entire account
+                                         # in just 8 trades). Capping at a fixed $ amount means every position
+                                         # costs roughly the same regardless of share price — a $20 stock and
+                                         # a $400 stock both get ~$175 allocated, just different share counts.
 THRESHOLD_MIN_SHARES         = 1
 THRESHOLD_CHECK_INTERVAL_MINUTES = 5    # how often the scheduler re-checks prices during market hours
 THRESHOLD_EARNINGS_BUFFER_DAYS = 3

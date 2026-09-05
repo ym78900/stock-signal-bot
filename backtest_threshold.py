@@ -2,7 +2,7 @@
 backtest_threshold.py — Historical simulation of threshold_strategy.py.
 
 Reuses the EXACT same decision functions the live strategy uses
-(evaluate_entry, evaluate_exit, calculate_shares) rather than a separate
+(evaluate_entry, evaluate_exit, calculate_position_dollars) rather than a separate
 reimplementation — so this tells us what the live strategy would actually
 have done, not an idealized approximation that could drift from reality.
 
@@ -163,10 +163,11 @@ def run_backtest(
                 signal = ts.evaluate_entry(ticker, sub, check_earnings=False)
                 if not signal:
                     continue
-                qty = ts.calculate_shares(signal["price"], equity_estimate)
-                if qty < config.THRESHOLD_MIN_SHARES:
+                position_dollars = ts.calculate_position_dollars(equity_estimate)
+                if position_dollars < 5.0:
                     continue
-                cost = signal["price"] * qty * (1 + fee_pct)
+                qty = position_dollars / signal["price"]  # fractional shares, matches live notional buying
+                cost = position_dollars * (1 + fee_pct)
                 if cost > cash:
                     continue
 
@@ -305,7 +306,7 @@ def print_report(result: dict) -> None:
     print(f"Max drawdown:        {result['max_drawdown_pct']}%")
     print(f"Open at end:         {len(result['open_positions_at_end'])} position(s)")
     for p in result["open_positions_at_end"]:
-        print(f"  • {p['ticker']}: {p['qty']}sh @ ${p['entry_price']:.2f} → "
+        print(f"  • {p['ticker']}: {p['qty']:.4f}sh @ ${p['entry_price']:.2f} → "
               f"${p['last_price']:.2f}  (unrealized ${p['unrealized_pnl']:+.2f}, "
               f"{'armed' if p['armed'] else 'not armed'})")
     print("-" * 60)

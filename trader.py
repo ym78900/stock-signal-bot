@@ -220,11 +220,23 @@ def place_market_buy(ticker: str, qty: int) -> Optional[str]:
         return None
 
 
-def place_market_sell(ticker: str, qty: int) -> Optional[str]:
+def _qty_str(qty) -> str:
+    """
+    Format a (possibly fractional) share quantity for Alpaca without
+    scientific notation or floating-point noise (e.g. 0.30000000000000004),
+    which Alpaca's order validation rejects.
+    """
+    s = f"{float(qty):.9f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def place_market_sell(ticker: str, qty) -> Optional[str]:
     """
     Place a simple market sell (used by threshold_strategy.py's own
     trailing-exit logic, which arms/tightens dynamically based on
     fee-aware profit thresholds rather than a static Alpaca trailing order).
+    qty may be fractional (float) — positions opened via a notional/dollar-
+    capped buy (place_market_buy_notional) hold fractional share counts.
     Returns the Alpaca order ID string, or None on failure.
     """
     try:
@@ -233,7 +245,7 @@ def place_market_sell(ticker: str, qty: int) -> Optional[str]:
 
         req = MarketOrderRequest(
             symbol        = ticker,
-            qty           = qty,
+            qty           = _qty_str(qty),
             side          = OrderSide.SELL,
             time_in_force = TimeInForce.DAY,
             order_class   = OrderClass.SIMPLE,
@@ -243,6 +255,36 @@ def place_market_sell(ticker: str, qty: int) -> Optional[str]:
         return str(order.id)
     except Exception as e:
         logger.error(f"Failed to place market sell for {ticker}: {e}")
+        return None
+
+
+def place_market_buy_notional(ticker: str, notional: float) -> Optional[str]:
+    """
+    Place a market buy for a fixed DOLLAR amount rather than a share count —
+    lets a fixed per-trade budget (e.g. $175) apply uniformly regardless of
+    share price, buying fractional shares for anything priced above that cap
+    per share instead of being unable to buy it at all.
+
+    Alpaca requires TimeInForce.DAY for notional/fractional orders (no GTC).
+    Not all symbols support fractional trading — Alpaca rejects the order in
+    that case, which the caller should treat as a normal failure (returns None).
+    """
+    try:
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+
+        req = MarketOrderRequest(
+            symbol        = ticker,
+            notional      = round(notional, 2),
+            side          = OrderSide.BUY,
+            time_in_force = TimeInForce.DAY,
+            order_class   = OrderClass.SIMPLE,
+        )
+        order = _trading_client().submit_order(req)
+        logger.info(f"Notional market buy placed: {ticker} ${notional:.2f}  id={order.id}")
+        return str(order.id)
+    except Exception as e:
+        logger.error(f"Failed to place notional market buy for {ticker}: {e}")
         return None
 
 
@@ -259,6 +301,23 @@ def get_order_fill_price(order_id: str) -> Optional[float]:
         return None
     except Exception as e:
         logger.error(f"get_order_fill_price({order_id}): {e}")
+        return None
+
+
+def get_order_fill_details(order_id: str) -> Optional[Tuple[float, float]]:
+    """
+    Return (fill_price, filled_qty) once an order fills, else None. Supports
+    fractional quantities — needed for notional (dollar-amount) buys where
+    the exact share count isn't known until the order actually fills.
+    """
+    try:
+        order  = _trading_client().get_order_by_id(order_id)
+        status = str(order.status).lower()
+        if status in ("filled", "partially_filled") and order.filled_avg_price and order.filled_qty:
+            return round(float(order.filled_avg_price), 4), float(order.filled_qty)
+        return None
+    except Exception as e:
+        logger.error(f"get_order_fill_details({order_id}): {e}")
         return None
 
 

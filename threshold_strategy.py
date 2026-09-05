@@ -189,7 +189,7 @@ def _read_all_trades() -> List[dict]:
 
 def log_closed_trade(
     ticker: str, entry_date: str, entry_price: float, exit_date: str,
-    exit_price: float, exit_reason: str, qty: int, alpaca_order_id: str,
+    exit_price: float, exit_reason: str, qty: float, alpaca_order_id: str,
 ) -> dict:
     _ensure_csv()
     fee_pct = config.THRESHOLD_FEE_PCT_PER_SIDE / 100.0
@@ -441,10 +441,19 @@ def get_ai_check(ticker: str, rsi: Optional[float], as_of_date=None) -> dict:
 
 # ── Position sizing ────────────────────────────────────────────────────────────
 
-def calculate_shares(price: float, account_equity: float) -> int:
-    cap_dollars = account_equity * config.THRESHOLD_MAX_POSITION_PCT
-    shares = int(cap_dollars // price)
-    return max(shares, 0)
+def calculate_position_dollars(account_equity: float) -> float:
+    """
+    The dollar amount to allocate to a new position — capped at a fixed
+    dollar amount (THRESHOLD_MAX_POSITION_DOLLARS), not a percentage of
+    equity. This is the binding limit in practice, so an expensive stock
+    and a cheap stock both get roughly the same dollar allocation per
+    signal instead of the expensive one eating a much bigger share of the
+    budget. Buying is fractional-share (notional), so this dollar amount
+    applies uniformly regardless of the stock's share price.
+    THRESHOLD_MAX_POSITION_PCT stays as a secondary safety cap.
+    """
+    pct_cap = account_equity * config.THRESHOLD_MAX_POSITION_PCT
+    return min(pct_cap, config.THRESHOLD_MAX_POSITION_DOLLARS)
 
 
 # ── Main cycle (called by scheduler) ──────────────────────────────────────────
@@ -485,15 +494,18 @@ def run_cycle() -> dict:
         if position.get("status") != "pending_fill":
             continue
         order_id = position.get("alpaca_order_id")
-        real_fill = trader.get_order_fill_price(order_id) if order_id else None
-        if real_fill:
+        fill = trader.get_order_fill_details(order_id) if order_id else None
+        if fill:
+            real_fill, real_qty = fill
             position["entry_price"] = real_fill
+            position["qty"] = real_qty
             position["peak"] = real_fill
             position["status"] = "open"
             positions[ticker] = position
-            logger.info(f"[{STRATEGY_NAME}] {ticker}: fill confirmed at ${real_fill:.2f}")
+            logger.info(f"[{STRATEGY_NAME}] {ticker}: fill confirmed at ${real_fill:.2f} x {real_qty} shares")
             telegram_notify.send(
-                f"✅ {ticker} fill confirmed @ ${real_fill:.2f}", prefix=f"[{STRATEGY_NAME}]"
+                f"✅ {ticker} fill confirmed @ ${real_fill:.2f} x {real_qty:.4f} shares",
+                prefix=f"[{STRATEGY_NAME}]",
             )
 
     # ── Manage open positions first (exits take priority over new entries) ──
@@ -584,9 +596,9 @@ def run_cycle() -> dict:
                 if not signal:
                     continue
 
-                qty = calculate_shares(signal["price"], account_equity)
-                if qty < config.THRESHOLD_MIN_SHARES:
-                    logger.info(f"[{STRATEGY_NAME}] {ticker}: signal fired but position size too small, skipping.")
+                position_dollars = calculate_position_dollars(account_equity)
+                if position_dollars < 5.0:
+                    logger.info(f"[{STRATEGY_NAME}] {ticker}: signal fired but budget too small (${position_dollars:.2f}), skipping.")
                     continue
 
                 ai_check = get_ai_check(ticker, signal.get("rsi"))
@@ -602,26 +614,30 @@ def run_cycle() -> dict:
                     )
                     continue
 
-                order_id = trader.place_market_buy(ticker, qty)
+                order_id = trader.place_market_buy_notional(ticker, position_dollars)
                 if order_id:
-                    # Poll briefly for the real fill price rather than trusting the
-                    # signal-time estimate — market orders during live trading hours
+                    # Poll briefly for the real fill (price AND quantity — a notional/
+                    # dollar-amount order's exact fractional share count isn't known
+                    # until it actually fills). Market orders during live trading hours
                     # usually fill within a couple seconds, but this also protects
                     # against the case where the order doesn't fill immediately
                     # (e.g. placed right at a halt, or outside hours) — those stay
                     # "pending_fill" and get reconciled on a later cycle instead of
-                    # locking in a stale/estimated entry price that could be very
-                    # wrong (confirmed bug: an order placed Saturday and left
-                    # unreconciled would carry Friday's estimated price into
-                    # Monday's actual, possibly very different, fill).
-                    real_fill = None
+                    # locking in a stale/estimated entry price/qty (confirmed bug: an
+                    # order placed Saturday and left unreconciled would carry Friday's
+                    # estimate into Monday's actual, possibly very different, fill).
+                    fill = None
                     for _ in range(5):
                         time.sleep(1)
-                        real_fill = trader.get_order_fill_price(order_id)
-                        if real_fill:
+                        fill = trader.get_order_fill_details(order_id)
+                        if fill:
                             break
 
-                    entry_price = real_fill or signal["price"]
+                    if fill:
+                        entry_price, qty = fill
+                    else:
+                        entry_price, qty = signal["price"], position_dollars / signal["price"]
+
                     positions[ticker] = {
                         "qty": qty,
                         "entry_price": entry_price,
@@ -629,7 +645,7 @@ def run_cycle() -> dict:
                         "armed": False,
                         "peak": entry_price,
                         "alpaca_order_id": order_id,
-                        "status": "open" if real_fill else "pending_fill",
+                        "status": "open" if fill else "pending_fill",
                     }
                     summary["buys"] += 1
                     ai_note = ""
@@ -638,10 +654,11 @@ def run_cycle() -> dict:
                             f" | AI: {ai_check['ai_verdict']} "
                             f"(sentiment {ai_check['sentiment_score']:+.2f}, {ai_check['catalyst_type']})"
                         )
-                    if not real_fill:
-                        ai_note += " | ⏳ order not yet filled, entry price will be confirmed on fill"
+                    if not fill:
+                        ai_note += " | ⏳ order not yet filled, entry price/qty will be confirmed on fill"
                     telegram_notify.send_trade_alert(
-                        STRATEGY_NAME, "BUY", ticker, signal["price"], signal["reason"] + ai_note
+                        STRATEGY_NAME, "BUY", ticker, signal["price"],
+                        signal["reason"] + f" | ${position_dollars:.2f} → {qty:.4f}sh" + ai_note
                     )
                 else:
                     summary["errors"] += 1
@@ -677,7 +694,7 @@ def send_heartbeat() -> None:
         if positions:
             for ticker, p in positions.items():
                 armed = "armed" if p.get("armed") else "not armed"
-                lines.append(f"  • {ticker}: {p['qty']}sh @ ${p['entry_price']:.2f} ({armed})")
+                lines.append(f"  • {ticker}: {p['qty']:.4f}sh @ ${p['entry_price']:.2f} ({armed})")
         lines.append(
             f"All-time: {stats['total_trades']} trades, "
             f"{stats['win_rate_pct']}% win rate, "
