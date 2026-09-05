@@ -3,19 +3,25 @@
 This does NOT predict price movement — it classifies whether current
 news is temporary noise or a real structural problem, to make the
 existing RSI-based signal (scanner.py, signals.py) more context-aware.
-The user acts on the result manually; nothing here executes trades.
+The user acts on the result manually; nothing here executes trades
+(for the swing bot's use — the threshold_strategy.py integration adds
+this as an optional informational/blocking layer, see that file).
+
+News source: Alpaca's official News API (market_data.get_recent_news),
+not a scraper — replaced an unofficial Finviz scraper for the same
+reliability reasoning as the yfinance->Alpaca migration for price data.
 """
 
 import json
 import os
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
 from openai import OpenAI
 
 import config
-import finviz_source
+import market_data
 
 _CACHE_FILE = Path(os.environ.get("SCAN_CACHE_DIR", Path(__file__).parent)) / "ai_sentiment_cache.json"
 
@@ -53,13 +59,26 @@ def _save_cache(cache: dict) -> None:
         pass
 
 
-def analyze_sentiment(ticker: str, company_name: Optional[str], headlines: list[dict]) -> Optional[dict]:
-    """Returns the sentiment/catalyst dict, or None if there's nothing to analyze."""
+def analyze_sentiment(
+    ticker: str,
+    company_name: Optional[str],
+    headlines: list[dict],
+    as_of_date: Optional[date] = None,
+) -> Optional[dict]:
+    """
+    Returns the sentiment/catalyst dict, or None if there's nothing to analyze.
+
+    as_of_date: the date to frame the analysis and cache key around.
+    Defaults to real today (live usage). Backtests MUST pass the simulated
+    date here — using real date.today() as the cache key regardless of the
+    simulated date would silently collide/corrupt results across different
+    backtest days (this was a real bug caught before it shipped).
+    """
     if not headlines:
         return None
 
-    today = date.today().isoformat()
-    cache_key = f"{ticker}:{today}"
+    effective_date = as_of_date or date.today()
+    cache_key = f"{ticker}:{effective_date.isoformat()}"
     cache = _load_cache()
     if cache_key in cache:
         return cache[cache_key]
@@ -72,7 +91,7 @@ def analyze_sentiment(ticker: str, company_name: Optional[str], headlines: list[
         model=_MODEL,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT.format(today=today)},
+            {"role": "system", "content": _SYSTEM_PROMPT.format(today=effective_date.isoformat())},
             {"role": "user", "content": user_prompt},
         ],
     )
@@ -113,10 +132,19 @@ def build_verdict(rsi: Optional[float], sentiment: Optional[dict]) -> dict:
     return {"ai_verdict": verdict, "ai_reasoning": reasoning}
 
 
-def get_ai_enrichment(ticker: str, company_name: Optional[str], rsi: Optional[float]) -> dict:
+def get_ai_enrichment(
+    ticker: str,
+    company_name: Optional[str],
+    rsi: Optional[float],
+    as_of_date: Optional[date] = None,
+) -> dict:
     """Fetch headlines, run sentiment analysis, and build the composite verdict.
     Never raises — returns all-None fields on any failure so it can't break the
-    base RSI/MA signal it's layered on top of."""
+    base RSI/MA signal it's layered on top of.
+
+    as_of_date: pass the simulated date for backtests (see analyze_sentiment
+    docstring) — None means "now" for live usage.
+    """
     defaults = {
         "sentiment_score": None,
         "confidence_score": None,
@@ -125,8 +153,9 @@ def get_ai_enrichment(ticker: str, company_name: Optional[str], rsi: Optional[fl
         "ai_reasoning": None,
     }
     try:
-        headlines = finviz_source.fetch_finviz_news(ticker)
-        sentiment = analyze_sentiment(ticker, company_name, headlines)
+        end_dt = datetime.combine(as_of_date, datetime.min.time()) if as_of_date else None
+        headlines = market_data.get_recent_news(ticker, end_date=end_dt)
+        sentiment = analyze_sentiment(ticker, company_name, headlines, as_of_date=as_of_date)
         if sentiment is None:
             return defaults
         return {

@@ -76,6 +76,8 @@ import config
 import market_data
 import trader
 import telegram_notify
+import ai_signal
+import signals as sig
 
 logger = logging.getLogger(__name__)
 
@@ -378,6 +380,55 @@ def evaluate_exit(ticker: str, position: dict, current_price: float, rsi: Option
     return {"action": "update_peak", "peak": peak}
 
 
+# ── AI sentiment layer (optional, on top of the quant entry signal) ──────────
+
+def get_ai_check(ticker: str, rsi: Optional[float], as_of_date=None) -> dict:
+    """
+    Fetch AI news sentiment for a candidate BUY signal. Never raises and
+    never blocks on its own missing/failed data (fail-open, same philosophy
+    as the VIX/SPY/earnings circuit breakers) — the caller decides whether
+    to actually use `should_block` based on config.THRESHOLD_AI_BLOCKING.
+
+    as_of_date: pass the simulated date for backtests.
+    """
+    result = {
+        "sentiment_score": None,
+        "confidence_score": None,
+        "catalyst_type": None,
+        "ai_verdict": None,
+        "ai_reasoning": None,
+        "should_block": False,
+        "had_news": False,
+    }
+    if not config.THRESHOLD_AI_ENABLED:
+        return result
+    try:
+        company_name = sig.get_company_name(ticker)
+        enrichment = ai_signal.get_ai_enrichment(ticker, company_name, rsi, as_of_date=as_of_date)
+        result.update(enrichment)
+        result["had_news"] = enrichment.get("sentiment_score") is not None
+
+        score = enrichment.get("sentiment_score")
+        confidence = enrichment.get("confidence_score") or 0.0
+        permanent_damage = False
+        # ai_signal doesn't expose is_permanent_damage directly in get_ai_enrichment's
+        # return (it's consumed internally by build_verdict) — re-derive from verdict:
+        # "AVOID" is exactly the case build_verdict assigns for permanent-damage-or-very-
+        # bearish RSI-oversold signals, which is exactly our entry condition (RSI oversold).
+        if enrichment.get("ai_verdict") == "AVOID":
+            permanent_damage = True
+
+        if permanent_damage or (
+            score is not None
+            and score <= config.THRESHOLD_AI_AVOID_SENTIMENT
+            and confidence >= config.THRESHOLD_AI_MIN_CONFIDENCE_TO_BLOCK
+        ):
+            result["should_block"] = True
+    except Exception as e:
+        logger.warning(f"[{STRATEGY_NAME}] AI check failed for {ticker} (failing open): {e}")
+    return result
+
+
 # ── Position sizing ────────────────────────────────────────────────────────────
 
 def calculate_shares(price: float, account_equity: float) -> int:
@@ -506,6 +557,19 @@ def run_cycle() -> dict:
                     logger.info(f"[{STRATEGY_NAME}] {ticker}: signal fired but position size too small, skipping.")
                     continue
 
+                ai_check = get_ai_check(ticker, signal.get("rsi"))
+                if config.THRESHOLD_AI_BLOCKING and ai_check["should_block"]:
+                    logger.info(
+                        f"[{STRATEGY_NAME}] {ticker}: BUY signal blocked by AI "
+                        f"(sentiment={ai_check['sentiment_score']}, verdict={ai_check['ai_verdict']}) "
+                        f"— {ai_check['ai_reasoning']}"
+                    )
+                    telegram_notify.send(
+                        f"🚫 {ticker} BUY signal blocked by AI — {ai_check['ai_reasoning'] or 'flagged as high risk'}",
+                        prefix=f"[{STRATEGY_NAME}]",
+                    )
+                    continue
+
                 order_id = trader.place_market_buy(ticker, qty)
                 if order_id:
                     positions[ticker] = {
@@ -517,8 +581,14 @@ def run_cycle() -> dict:
                         "alpaca_order_id": order_id,
                     }
                     summary["buys"] += 1
+                    ai_note = ""
+                    if ai_check["had_news"]:
+                        ai_note = (
+                            f" | AI: {ai_check['ai_verdict']} "
+                            f"(sentiment {ai_check['sentiment_score']:+.2f}, {ai_check['catalyst_type']})"
+                        )
                     telegram_notify.send_trade_alert(
-                        STRATEGY_NAME, "BUY", ticker, signal["price"], signal["reason"]
+                        STRATEGY_NAME, "BUY", ticker, signal["price"], signal["reason"] + ai_note
                     )
                 else:
                     summary["errors"] += 1

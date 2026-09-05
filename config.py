@@ -183,3 +183,13 @@ THRESHOLD_MAX_POSITION_PCT   = 0.12     # 12% of THRESHOLD_ACCOUNT_EQUITY per po
 THRESHOLD_MIN_SHARES         = 1
 THRESHOLD_CHECK_INTERVAL_MINUTES = 5    # how often the scheduler re-checks prices during market hours
 THRESHOLD_EARNINGS_BUFFER_DAYS = 3
+
+# ── AI sentiment layer (optional, on top of the quant entry signal) ─────────
+# Phase 1: informational only (shown in Telegram, never blocks a trade).
+# Phase 2 (THRESHOLD_AI_BLOCKING): skip a trade the quant rules approved if
+# AI flags real business impairment — decide based on the 3-month
+# AI-in-the-loop backtest (backtest_threshold.py --ai), not a guess.
+THRESHOLD_AI_ENABLED = True
+THRESHOLD_AI_BLOCKING = False
+THRESHOLD_AI_AVOID_SENTIMENT = -0.5      # sentiment_score at/below this + high confidence = block
+THRESHOLD_AI_MIN_CONFIDENCE_TO_BLOCK = 0.6

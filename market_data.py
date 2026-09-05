@@ -10,11 +10,18 @@ cookie auth), silently breaking every scan for days with zero trades placed.
 Alpaca's Market Data API is a real, documented, authenticated API (using the
 same keys already used for trading) — no cookie-scraping fragility.
 
-yfinance is kept ONLY for two low-frequency, non-blocking, supplementary
-lookups that Alpaca's free tier doesn't provide (earnings calendar/growth,
-VIX index level) — both already fail open (never block a trade decision) and
-are called far less often than the bulk scan, so residual yfinance flakiness
-there is a minor, non-critical inconvenience rather than a silent outage.
+yfinance is kept ONLY for one low-frequency, non-blocking, supplementary
+lookup that Alpaca's free tier doesn't provide (VIX index level) — it
+already fails open (never blocks a trade decision) and is called far less
+often than the bulk scan, so residual yfinance flakiness there is a minor,
+non-critical inconvenience rather than a silent outage.
+
+News (get_recent_news, below) uses Alpaca's official News API (Benzinga-
+sourced) — this replaced an unofficial Finviz scraper (finviz_source.py,
+now deleted) for the same "unofficial scraper is a silent failure risk"
+reason yfinance was replaced for price data. Earnings-date lookups also
+still use yfinance (trader.check_earnings, signals.fetch_earnings_growth)
+since Alpaca has no earnings-calendar endpoint — same fail-open treatment.
 """
 
 import logging
@@ -203,3 +210,57 @@ def get_spy_trend() -> tuple:
     except Exception as e:
         logger.error(f"SPY trend check failed: {e}")
         return True, 0.0
+
+
+def get_recent_news(
+    ticker: str,
+    end_date: Optional[datetime] = None,
+    lookback_days: int = 14,
+    limit: int = 10,
+) -> List[dict]:
+    """
+    Fetch recent news headlines for a ticker via Alpaca's News API
+    (Benzinga-sourced, official/authenticated — replaces the old Finviz
+    scraper entirely, including for backtesting: `end_date` lets us query
+    only news that existed as of a given historical date, avoiding the
+    lookahead-bias bug we hit with the earnings-calendar check).
+
+    Returns a list of {"title": str, "date": str, "url": str} — same shape
+    the AI sentiment layer (ai_signal.py) already expects, so no changes
+    needed there beyond the source swap.
+
+    end_date=None means "up to now" (live usage). For backtests, pass the
+    simulated date so the AI only ever sees news that existed at that point
+    in time.
+    """
+    try:
+        from alpaca.data.historical.news import NewsClient
+        from alpaca.data.requests import NewsRequest
+
+        end = end_date or datetime.utcnow()
+        start = end - timedelta(days=lookback_days)
+
+        client = NewsClient(
+            api_key=os.environ["ALPACA_API_KEY"],
+            secret_key=os.environ["ALPACA_SECRET_KEY"],
+        )
+        req = NewsRequest(symbols=ticker, start=start, end=end, limit=limit)
+        result = client.get_news(req)
+
+        items = result.news if hasattr(result, "news") else result.data.get("news", [])
+        headlines = []
+        for item in items:
+            title = getattr(item, "headline", None) or (item.get("headline") if isinstance(item, dict) else None)
+            created = getattr(item, "created_at", None) or (item.get("created_at") if isinstance(item, dict) else None)
+            url = getattr(item, "url", None) or (item.get("url") if isinstance(item, dict) else None)
+            if not title:
+                continue
+            headlines.append({
+                "title": title,
+                "date": str(created)[:10] if created else None,
+                "url": url,
+            })
+        return headlines
+    except Exception as e:
+        logger.warning(f"Alpaca news fetch failed for {ticker}: {e}")
+        return []
