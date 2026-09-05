@@ -154,7 +154,7 @@ def run_backtest(
                 sub = df.loc[:day]
                 if sub.empty or sub.index[-1] != day:
                     continue
-                signal = ts.evaluate_entry(ticker, sub)
+                signal = ts.evaluate_entry(ticker, sub, check_earnings=False)
                 if not signal:
                     continue
                 qty = ts.calculate_shares(signal["price"], equity_estimate)
@@ -228,6 +228,8 @@ def print_report(result: dict) -> None:
     print("=" * 60)
     print(f"Period:              {result['period']}")
     print(f"Tickers tested:      {result['tickers_tested']}")
+    print("Note: earnings-date filter is DISABLED in this backtest (no historical")
+    print("      earnings-calendar data source integrated — see evaluate_entry() docstring).")
     print(f"Initial equity:      ${result['initial_equity']:,.2f}")
     print(f"Final equity:        ${result['final_equity']:,.2f}")
     print(f"Total return:        {result['total_return_pct']:+.2f}%")

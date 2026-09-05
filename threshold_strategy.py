@@ -263,11 +263,21 @@ def _distress_check(df) -> tuple:
     return True, None
 
 
-def evaluate_entry(ticker: str, df) -> Optional[dict]:
-    """Return a dict describing the BUY signal if all entry conditions are met, else None."""
+def evaluate_entry(ticker: str, df, check_earnings: bool = True) -> Optional[dict]:
+    """
+    Return a dict describing the BUY signal if all entry conditions are met, else None.
+
+    check_earnings: set False in backtests. trader.check_earnings() calls a
+    live "next earnings date relative to today" lookup — correct for live
+    trading, but meaningless against a simulated historical date (there's no
+    historical earnings-calendar data source integrated yet). Rather than
+    silently produce a filter that's checking the wrong date, backtests skip
+    this filter entirely and say so.
+    """
     try:
         if len(df) < max(config.THRESHOLD_DIP_LOOKBACK_DAYS, config.RSI_PERIOD) + 5:
             return None
+
 
         price = float(df["Close"].iloc[-1])
         if price < config.THRESHOLD_PRICE_MIN or price > config.THRESHOLD_PRICE_MAX:
@@ -299,14 +309,16 @@ def evaluate_entry(ticker: str, df) -> Optional[dict]:
             logger.info(f"[{STRATEGY_NAME}] {ticker}: skipped — {reason}")
             return None
 
-        # Best-effort earnings check (never blocks on failure)
-        try:
-            earnings_safe, _ = trader.check_earnings(ticker)
-            if not earnings_safe:
-                logger.info(f"[{STRATEGY_NAME}] {ticker}: skipped — earnings within buffer window")
-                return None
-        except Exception:
-            pass
+        # Best-effort earnings check (never blocks on failure). Skipped
+        # entirely in backtests — see check_earnings param docstring above.
+        if check_earnings:
+            try:
+                earnings_safe, _ = trader.check_earnings(ticker)
+                if not earnings_safe:
+                    logger.info(f"[{STRATEGY_NAME}] {ticker}: skipped — earnings within buffer window")
+                    return None
+            except Exception:
+                pass
 
         return {
             "ticker": ticker,
