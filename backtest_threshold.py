@@ -48,7 +48,7 @@ def run_backtest(
     initial_equity: float = 5000.0,
     verbose: bool = True,
 ) -> dict:
-    end = datetime.utcnow()
+    end = pd.Timestamp.now(tz="UTC")
     start = end - timedelta(days=months * 31)
     # Extra buffer before start_date for indicator warmup (distress lookback
     # is the longest at ~126 trading days ≈ 180 calendar days).
