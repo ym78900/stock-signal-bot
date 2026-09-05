@@ -178,7 +178,16 @@ THRESHOLD_DISTRESS_MAX_DRAWDOWN_PCT = 45.0  # skip if already down more than thi
 THRESHOLD_MIN_AVG_VOLUME     = 200_000  # liquidity floor, same reasoning as swing bot
 THRESHOLD_PRICE_MIN          = 5.0      # same distress-price floor as swing bot
 THRESHOLD_PRICE_MAX          = 500.0    # simple bot — allow pricier names than the swing bot
-THRESHOLD_MAX_OPEN_POSITIONS = 8
+THRESHOLD_MAX_OPEN_POSITIONS = 28  # 3-month S&P 500 backtest (backtest_threshold.py --max-positions N):
+                                    # 8 -> +3.12%, 15 -> +2.97%, 25 -> +6.64%, 50 -> +7.17%, unlimited -> +7.17%
+                                    # (identical to 50 — with $175/position on $5k equity, cash itself caps
+                                    # deployment at ~28 positions; raising the cap further has zero effect).
+                                    # Old default of 8 was carried over from the swing bot's own separately-
+                                    # tuned config, never actually backtested for this strategy — left roughly
+                                    # half the achievable return on the table for a fairly small drawdown
+                                    # saving (2.24% vs 6.31% DD). 28 captures nearly all the upside while
+                                    # naturally matching the real cash ceiling (no free lunch from setting it
+                                    # higher than the account can actually fund).
 THRESHOLD_MAX_POSITION_PCT   = 0.12     # secondary safety cap only — see THRESHOLD_MAX_POSITION_DOLLARS below
 THRESHOLD_MAX_POSITION_DOLLARS = 175.0  # hard $ cap per position — the actual sizing limit in practice.
                                          # Without this, 12% of a $5k account (~$600/trade) lets expensive
