@@ -158,6 +158,11 @@ TELEGRAM_ENABLED = True
 
 # ── Threshold + RSI strategy (new, simple mean-reversion module) ─────────────
 # Separate from the swing/ATR-trailing strategy above — see threshold_strategy.py
+# Broker: Alpaca only. Bitget Stock+ was evaluated and rejected as an
+# execution venue (no paper trading mode, smaller symbol coverage than
+# Alpaca, KYC-gated real-money-only API) — see threshold_strategy.py
+# docstring for the full reasoning. Do not add a Bitget adapter without
+# new information that changes this.
 THRESHOLD_STRATEGY_ENABLED   = True
 THRESHOLD_ACCOUNT_EQUITY     = 5000.0   # paper capital assumption for sizing
 THRESHOLD_DIP_PCT            = 5.0      # buy when price is down this % from N-day high

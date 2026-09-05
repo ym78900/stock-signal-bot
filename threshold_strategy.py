@@ -38,6 +38,26 @@ State files (all separate from the swing bot's trades.csv/pending_trades.json):
   threshold_positions.json — open positions with entry/peak/armed state
   threshold_trades.csv     — closed-trade log with real fees + net P&L
   threshold_paused.flag    — kill switch
+
+Broker: Alpaca only (decided after evaluating Bitget Stock+ as an
+alternative — see below). Do not re-litigate this without new information.
+
+  Bitget Stock+ (tokenized US stocks) was considered so tickers "unavailable"
+  on Alpaca could still be traded. Checked their live API docs
+  (bitget.com/api-doc/uta/stockplus/) directly:
+    - No paper/demo trading mode exists for Stock+ at all — every order is
+      real money. Conflicts with "paper trade first."
+    - Requires KYC + a separate in-app "US stock module" activation before
+      the trading API even works — a real brokered product, not a sandbox.
+    - Symbol coverage is a small curated list (~40-45 large caps in their
+      published option-eligible lists) — a SUBSET of, not an addition to,
+      Alpaca's coverage.
+  Alpaca has 13,404 tradable US equities (confirmed live from this account)
+  with real, working paper trading and deep real-exchange liquidity, vs.
+  Bitget's tokenized/market-maker-quoted wrapper. There is no realistic
+  scenario where a ticker exists on Bitget Stock+ but not Alpaca, so the
+  "combine both" idea added risk (no paper mode, thinner liquidity) with no
+  actual coverage benefit. Alpaca-only.
 """
 
 import csv
