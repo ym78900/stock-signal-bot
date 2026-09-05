@@ -418,10 +418,19 @@ def get_ai_check(ticker: str, rsi: Optional[float], as_of_date=None) -> dict:
         if enrichment.get("ai_verdict") == "AVOID":
             permanent_damage = True
 
-        if permanent_damage or (
-            score is not None
-            and score <= config.THRESHOLD_AI_AVOID_SENTIMENT
-            and confidence >= config.THRESHOLD_AI_MIN_CONFIDENCE_TO_BLOCK
+        catalyst = enrichment.get("catalyst_type")
+        catalyst_allowed = catalyst in config.THRESHOLD_AI_BLOCK_CATALYSTS
+
+        # Restricting to specific catalyst types (see config.py comment): the
+        # 3-month backtest found AI over-eager to call ordinary analyst
+        # downgrades/macro jitters "fundamental impairment" — every incorrect
+        # block in the unrestricted run was outside THRESHOLD_AI_BLOCK_CATALYSTS.
+        if catalyst_allowed and (
+            permanent_damage or (
+                score is not None
+                and score <= config.THRESHOLD_AI_AVOID_SENTIMENT
+                and confidence >= config.THRESHOLD_AI_MIN_CONFIDENCE_TO_BLOCK
+            )
         ):
             result["should_block"] = True
     except Exception as e:

@@ -187,9 +187,24 @@ THRESHOLD_EARNINGS_BUFFER_DAYS = 3
 # ── AI sentiment layer (optional, on top of the quant entry signal) ─────────
 # Phase 1: informational only (shown in Telegram, never blocks a trade).
 # Phase 2 (THRESHOLD_AI_BLOCKING): skip a trade the quant rules approved if
-# AI flags real business impairment — decide based on the 3-month
-# AI-in-the-loop backtest (backtest_threshold.py --ai), not a guess.
+# AI flags real business impairment.
+#
+# 3-month S&P 500 backtest findings (backtest_threshold.py --ai, Sept 2026):
+#   Unrestricted blocking (any catalyst type): blocked 9 signals, only 3 were
+#   actual losses, 6 were actual wins — net WORSE than no blocking at all
+#   (+$375.79 vs +$442.71 baseline). The AI was too willing to call ordinary
+#   analyst downgrades / macro jitters "fundamental impairment" despite its
+#   own prompt telling it to distinguish noise from real damage.
+#   Restricted to catalyst_type == "Lawsuit/Regulatory" only: every incorrect
+#   block in the unrestricted run was Analyst Rating/Macro/General Noise —
+#   restricting to Lawsuit/Regulatory keeps the 3 real catches (avoided
+#   -$88.24 in real losses) while dropping most of the false positives.
+#   Net effect on this sample: better than both unrestricted blocking and
+#   no blocking. Re-verify with --ai after this change before trusting it
+#   on a new sample.
 THRESHOLD_AI_ENABLED = True
-THRESHOLD_AI_BLOCKING = False
+THRESHOLD_AI_BLOCKING = True
+THRESHOLD_AI_BLOCK_CATALYSTS = ["Lawsuit/Regulatory"]  # only these catalyst types can trigger a block
 THRESHOLD_AI_AVOID_SENTIMENT = -0.5      # sentiment_score at/below this + high confidence = block
+THRESHOLD_AI_MIN_CONFIDENCE_TO_BLOCK = 0.6
 THRESHOLD_AI_MIN_CONFIDENCE_TO_BLOCK = 0.6
