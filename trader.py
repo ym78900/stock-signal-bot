@@ -332,6 +332,51 @@ def cancel_order(order_id: str) -> bool:
         return False
 
 
+def place_stop_loss_order(ticker: str, qty, stop_price: float) -> Optional[str]:
+    """
+    Place a broker-side (Alpaca-enforced) stop-loss sell order — a safety
+    net that protects a position even if this server/service is down,
+    unlike the software-managed trailing exit which only runs when our
+    5-minute scheduler cycle actually executes.
+
+    Fractional shares support stop orders, but ONLY with time_in_force=DAY
+    (confirmed via Alpaca docs — GTC is not available for fractional qty).
+    This means the order expires at end of day and must be re-placed each
+    trading day — see threshold_strategy.py's ensure_stop_loss() for the
+    daily refresh logic. There's a small residual gap: if the service is
+    down across the exact market-open moment before a fresh day's stop can
+    be placed, that day starts unprotected until it catches up — much
+    better than being unprotected at all times, but not a perfect 24/7 net.
+    """
+    try:
+        from alpaca.trading.requests import StopOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+
+        req = StopOrderRequest(
+            symbol        = ticker,
+            qty           = _qty_str(qty),
+            side          = OrderSide.SELL,
+            time_in_force = TimeInForce.DAY,
+            stop_price    = round(stop_price, 2),
+        )
+        order = _trading_client().submit_order(req)
+        logger.info(f"Broker-side stop-loss placed: {ticker} qty={qty} stop=${stop_price:.2f}  id={order.id}")
+        return str(order.id)
+    except Exception as e:
+        logger.error(f"Failed to place stop-loss order for {ticker}: {e}")
+        return None
+
+
+def get_order_status(order_id: str) -> Optional[str]:
+    """Return the raw lowercase order status string, or None if not found/error."""
+    try:
+        order = _trading_client().get_order_by_id(order_id)
+        return str(order.status).lower()
+    except Exception as e:
+        logger.debug(f"get_order_status({order_id}): {e}")
+        return None
+
+
 def place_trailing_stop_exit(
     ticker: str,
     qty: int,

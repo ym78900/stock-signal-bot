@@ -439,6 +439,115 @@ def get_ai_check(ticker: str, rsi: Optional[float], as_of_date=None) -> dict:
     return result
 
 
+# ── Broker-side stop-loss safety net ──────────────────────────────────────────
+
+def _manage_broker_stop(ticker: str, position: dict) -> bool:
+    """
+    Ensure a real Alpaca stop-loss order backs this position (protects it
+    even if this server is down between our 5-min cycles), and check
+    whether it already fired since we last looked.
+
+    Alpaca only supports DAY time-in-force for fractional-share stop
+    orders (no GTC) — so the order expires at end of day and must be
+    re-placed each trading day. That's handled here via stop_order_date.
+
+    Returns True if the position is now closed (the broker-side stop
+    already filled) — caller should remove it from positions and log the
+    trade. Returns False if the position is still open (whether or not a
+    fresh stop order was just placed).
+    """
+    today_str = str(date.today())
+    stop_id = position.get("stop_order_id")
+
+    # Check if an existing stop order already filled (protected us while
+    # we weren't looking — exactly the scenario this exists for).
+    if stop_id:
+        status = trader.get_order_status(stop_id)
+        if status == "filled":
+            fill = trader.get_order_fill_details(stop_id)
+            exit_price, qty = fill if fill else (position["entry_price"] * (1 - config.THRESHOLD_HARD_STOP_PCT / 100), position["qty"])
+            log_closed_trade(
+                ticker=ticker,
+                entry_date=position["entry_date"],
+                entry_price=position["entry_price"],
+                exit_date=today_str,
+                exit_price=exit_price,
+                exit_reason="broker-side hard stop (safety net)",
+                qty=qty,
+                alpaca_order_id=stop_id,
+            )
+            logger.warning(f"[{STRATEGY_NAME}] {ticker}: broker-side stop-loss FIRED (server may have been down) @ ${exit_price:.2f}")
+            telegram_notify.send(
+                f"🛑 {ticker} broker-side stop-loss fired @ ${exit_price:.2f} — this protected the position "
+                f"even though our own cycle didn't catch it in time.",
+                prefix=f"[{STRATEGY_NAME}]",
+            )
+            return True
+
+    # Refresh/place the stop order if missing or from a previous day (DAY
+    # orders expire at end of day and don't roll over automatically).
+    if position.get("stop_order_date") != today_str:
+        stop_price = position["entry_price"] * (1 - config.THRESHOLD_HARD_STOP_PCT / 100)
+        new_id = trader.place_stop_loss_order(ticker, position["qty"], stop_price)
+        if new_id:
+            position["stop_order_id"] = new_id
+            position["stop_order_date"] = today_str
+        else:
+            logger.warning(f"[{STRATEGY_NAME}] {ticker}: failed to place broker-side stop-loss — relying on software exit only this cycle.")
+
+    return False
+
+
+# ── Market-wide circuit breaker ───────────────────────────────────────────────
+
+_CIRCUIT_BREAKER_ALERT_FILE = os.path.join(BASE_DIR, "threshold_circuit_breaker_alerted.txt")
+
+
+def check_market_circuit_breakers() -> tuple:
+    """
+    Reuses the swing bot's existing SPY-trend and VIX checks (trader.py) —
+    skip new entries (existing positions still get managed normally) when
+    the broader market is in a bad state. Alerts once per day, not every
+    5-minute cycle, to avoid Telegram spam while still being visible.
+    """
+    if config.USE_SPY_TREND_FILTER:
+        safe, spy_price = trader.check_spy_trend()
+        if not safe:
+            _alert_circuit_breaker_once(f"SPY below 50-day MA (${spy_price:.2f}) — new entries paused, existing positions still managed.")
+            return False, "SPY below 50-day MA"
+
+    if config.USE_VIX_FILTER:
+        safe, vix_level = trader.check_vix()
+        if not safe:
+            _alert_circuit_breaker_once(f"VIX={vix_level} ≥ {config.VIX_MAX} — new entries paused, existing positions still managed.")
+            return False, f"VIX={vix_level} too high"
+
+    # Market safe again — clear the alert-once flag so tomorrow's re-trigger notifies again.
+    if os.path.exists(_CIRCUIT_BREAKER_ALERT_FILE):
+        os.remove(_CIRCUIT_BREAKER_ALERT_FILE)
+    return True, ""
+
+
+def _alert_circuit_breaker_once(message: str) -> None:
+    today_str = str(date.today())
+    last_alerted = None
+    if os.path.exists(_CIRCUIT_BREAKER_ALERT_FILE):
+        try:
+            last_alerted = open(_CIRCUIT_BREAKER_ALERT_FILE).read().strip()
+        except Exception:
+            pass
+    if last_alerted == today_str:
+        logger.info(f"[{STRATEGY_NAME}] Circuit breaker active: {message} (already alerted today)")
+        return
+    logger.warning(f"[{STRATEGY_NAME}] Circuit breaker active: {message}")
+    telegram_notify.send(f"⛔ {message}", prefix=f"[{STRATEGY_NAME}]")
+    try:
+        with open(_CIRCUIT_BREAKER_ALERT_FILE, "w") as f:
+            f.write(today_str)
+    except Exception:
+        pass
+
+
 # ── Position sizing ────────────────────────────────────────────────────────────
 
 def calculate_position_dollars(account_equity: float) -> float:
@@ -514,6 +623,17 @@ def run_cycle() -> dict:
             continue  # nothing to manage yet — no confirmed entry price
         summary["checked"] += 1
         try:
+            # Broker-side stop-loss safety net: ensure one exists for today,
+            # and check whether it already fired (protecting the position
+            # while we weren't looking — e.g. server was down). If it fired,
+            # this position is already closed; don't also run our own exit
+            # logic against it this cycle.
+            closed_via_stop = _manage_broker_stop(ticker, position)
+            if closed_via_stop:
+                del positions[ticker]
+                summary["sells"] += 1
+                continue
+
             df = data.get(ticker)
             current_price = market_data.get_latest_price(ticker)
             if current_price is None and df is not None and not df.empty:
@@ -550,6 +670,12 @@ def run_cycle() -> dict:
 
             elif decision["action"] == "sell":
                 qty = position["qty"]
+                # Cancel the broker-side stop-loss first — otherwise Alpaca
+                # rejects our market sell (shares already held for the
+                # resting stop order) or we end up with two competing sells.
+                stop_id = position.get("stop_order_id")
+                if stop_id:
+                    trader.cancel_order(stop_id)
                 order_id = trader.place_market_sell(ticker, qty)
                 if order_id:
                     log_closed_trade(
@@ -579,23 +705,49 @@ def run_cycle() -> dict:
     save_positions(positions)
 
     # ── Check for new entries ────────────────────────────────────────────────
-    if len(positions) >= config.THRESHOLD_MAX_OPEN_POSITIONS:
+    market_safe, market_block_reason = check_market_circuit_breakers()
+    if not market_safe:
+        logger.info(f"[{STRATEGY_NAME}] New entries skipped — market circuit breaker: {market_block_reason}")
+    elif len(positions) >= config.THRESHOLD_MAX_OPEN_POSITIONS:
         logger.info(f"[{STRATEGY_NAME}] Max open positions ({config.THRESHOLD_MAX_OPEN_POSITIONS}) reached — skipping new entries.")
     else:
+        # Collect ALL valid candidates first, then take the strongest signals
+        # (most oversold RSI first) up to however many slots are open —
+        # instead of just taking whichever tickers happen to be checked
+        # first in watchlist order, which has no relationship to signal
+        # quality when there are more candidates than open slots.
+        candidates = []
         for ticker in watchlist:
             if ticker in positions:
                 continue
-            if len(positions) >= config.THRESHOLD_MAX_OPEN_POSITIONS:
-                break
             summary["checked"] += 1
             try:
                 df = data.get(ticker)
                 if df is None or df.empty:
                     continue
                 signal = evaluate_entry(ticker, df)
-                if not signal:
-                    continue
+                if signal:
+                    candidates.append((ticker, signal))
+            except Exception as e:
+                summary["errors"] += 1
+                logger.error(f"[{STRATEGY_NAME}] Error evaluating entry for {ticker}: {e}")
 
+        candidates.sort(key=lambda c: c[1].get("rsi", 100))  # most oversold first
+        if len(candidates) > 1:
+            logger.info(
+                f"[{STRATEGY_NAME}] {len(candidates)} candidate signal(s) found, "
+                f"ranked by RSI (most oversold first): {[c[0] for c in candidates[:10]]}"
+                + (" ..." if len(candidates) > 10 else "")
+            )
+
+        for idx, (ticker, signal) in enumerate(candidates):
+            if len(positions) >= config.THRESHOLD_MAX_OPEN_POSITIONS:
+                logger.info(
+                    f"[{STRATEGY_NAME}] Max open positions reached — "
+                    f"{len(candidates) - idx} remaining candidate(s) skipped this cycle."
+                )
+                break
+            try:
                 position_dollars = calculate_position_dollars(account_equity)
                 if position_dollars < 5.0:
                     logger.info(f"[{STRATEGY_NAME}] {ticker}: signal fired but budget too small (${position_dollars:.2f}), skipping.")
@@ -666,7 +818,7 @@ def run_cycle() -> dict:
 
             except Exception as e:
                 summary["errors"] += 1
-                logger.error(f"[{STRATEGY_NAME}] Error evaluating entry for {ticker}: {e}")
+                logger.error(f"[{STRATEGY_NAME}] Error placing entry for {ticker}: {e}")
 
         save_positions(positions)
 
