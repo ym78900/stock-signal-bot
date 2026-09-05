@@ -1,151 +1,69 @@
 # Stock Signal Bot
 
-A fully automated swing trading bot that scans all S&P 500 stocks every day, generates BUY signals, and places orders automatically on Alpaca paper trading with a native trailing stop exit.
+Two things live in this repo, running on a VPS via systemd (`stock-signal-bot.service`):
+
+1. **Swing signal API** — on-demand RSI/MA/AI-sentiment analysis served over HTTP for a companion iOS app. Does not place trades automatically; the user acts on signals manually via the app.
+2. **Threshold strategy** — a separate, fully automated dip-buy + RSI + AI-sentiment-gated bot that actually places paper trades on a schedule. This is the part that trades unattended.
 
 ---
 
-## What it does
+## 1. Swing signal API (manual, on-demand)
 
-Every trading day it:
+`api_server.py` (FastAPI) serves scan/signal data to an iOS app:
 
-1. **Scans all 503 S&P 500 stocks** before market open and picks the top 50 most interesting for the day
-2. **Posts a morning watchlist** to a private Telegram channel
-3. **After market close**, scans all 503 stocks for BUY signals using RSI + volume confirmation
-4. **Queues valid signals** and executes orders at 9:25 AM ET the next morning (two-phase: market buy → fill detected → trailing stop placed)
-5. **Monitors open positions** every 15 minutes — notifies when trailing stop fires or max hold is reached
-6. **Posts a weekly performance report** every Sunday with full stats vs backtest baseline
+- `GET /watchlist` — top-scored S&P 500 stocks (RSI + volume + momentum composite)
+- `GET /watchlist/low` / `/watchlist/high` — oversold / overbought filtered lists
+- `GET /signal?ticker=` — RSI/MA/AI-sentiment analysis for one ticker
+- `POST /portfolio/signals` (+ `/base`, `/ai`) — batch signals for held tickers
+- `GET /search?q=` — ticker search
 
----
+Auth via `x-app-password` header (`STOCK_API_PASSWORD` env var). Nothing on this side executes orders — it's read-only analysis, consumed manually.
 
-## Signal logic
+Market data: Alpaca Market Data API (`market_data.py`). Previously used `yfinance`, which failed constantly in production (Yahoo's anti-bot cookie auth) — replaced entirely for price/volume/news. `yfinance` remains only for the earnings-calendar lookup (Alpaca has no equivalent endpoint), which fails open and never blocks a decision.
 
-```
-BUY signal fires when:
-  RSI(14) < 38          — stock is oversold on daily candles
-  Volume > 1.2× avg     — confirmed interest, not a quiet drift
-  20MA > 50MA           — uptrend confirmed (or golden cross)
-  SPY above 50MA        — only trade in bull market conditions
-  VIX < 25              — skip if fear/volatility is spiking
-  No earnings ±3 days   — avoid earnings volatility
-  Price $5–$200         — within tradeable range
-
-Entry:        Market order at 9:30 AM ET open
-Trailing stop: ATR × 3.5 below running peak (Alpaca manages server-side)
-Position:     12% of portfolio per trade (min 3 shares)
-Max open:     7 positions simultaneously
-Max hold:     60 calendar days (force-close safety net)
-```
-
-Parameters confirmed across an 8-round backtesting framework on 2 years of S&P 500 data.
-The corrected backtester (Round 8: enforces the position cap **and** a cash constraint —
-earlier rounds did neither, which inflated the numbers ~10×):
-
-| Metric | Value |
-|---|---|
-| 2-year return | +$1,568 on $5,000 (+31.4%) |
-| Win rate | 51.5% |
-| Profit factor | 1.86 |
-| Max drawdown | 10.5% |
-| Trades | 101 |
-| Per day | ~$3.11 (~13%/yr) |
-
-> Returns scale linearly with capital (~$3/day per $5k). The ~€40/day goal needs
-> ~$60–70k of capital, not $5k — the strategy is profitable but earlier "$48/day"
-> figures were a backtester artifact.
+AI sentiment (`ai_signal.py`): sends recent headlines (Alpaca News API, Benzinga-sourced) to `gpt-4o-mini`, classifies sentiment/catalyst type/permanent-damage, cached per ticker/day.
 
 ---
 
-## Order execution (two-phase, fill-based)
+## 2. Threshold strategy (automated, paper trading)
 
-```
-9:25 AM ET  → Market buy placed (no stop/target yet)
-9:30 AM ET  → Alpaca fills the order at open
-9:32 AM ET  → Bot detects real fill price
-             → trail_price = ATR × 3.5
-             → Trailing stop sell placed with Alpaca
-             → Alpaca raises stop automatically as price rises
-             → Position has no fixed take-profit cap — trail handles the exit
-60 days     → If still open, monitor cancels trail + market sells
-```
+`threshold_strategy.py` + APScheduler (in `api_server.py`), running every 5 minutes during US market hours.
 
-**Why two-phase:** prior close ≠ actual fill price (overnight gaps). Using the real fill price ensures the ATR×3.5 trail distance is measured from where you actually bought.
+**Entry** — all of:
+- Price down ≥5% from its 20-day high, AND RSI(14) < 40 (oversold)
+- Price $5–$500, average volume ≥ 200K/day (liquidity floor)
+- Not already down >45% over the last ~6 months (falling-knife/distress guard)
+- No earnings within 3 days (best-effort, fails open)
+- **AI check**: if Alpaca News + gpt-4o-mini flags a real Lawsuit/Regulatory risk with high confidence, the trade is blocked — see `THRESHOLD_AI_BLOCKING` in `config.py` for why blocking is restricted to that one catalyst category (backtested: unrestricted blocking on any catalyst type made results worse, blocking real winners on ordinary analyst-downgrade/macro noise)
 
----
+**Exit** — adaptive, not a fixed take-profit:
+- Once price clears round-trip fees + a minimum margin, the exit "arms" and trails the peak (default 2% trail) — lets winners run instead of capping them
+- Independent hard stop-loss at -9%, regardless of RSI/trailing state
+- RSI-overbought while armed also triggers an exit (take profit rather than risk giving it back)
 
-## Daily schedule (Finnish time)
+State: `threshold_watchlist.json`, `threshold_positions.json`, `threshold_trades.csv`, `threshold_paused.flag` (kill switch) — separate from anything the swing API side touches.
 
-| Time | Job |
-|---|---|
-| 4:00 PM | Morning scan — score all 503 stocks |
-| 4:20 PM | Post watchlist to Telegram |
-| 4:25 PM | Execute queued trades — Phase 1: market buys placed |
-| ~4:32 PM | Phase 2: poll fills → place trailing stops |
-| 4:30–11:00 PM | Monitor positions every 15 min |
-| 11:15 PM | Auto-scan all 503 tickers for BUY signals, queue for tomorrow |
-| Sunday 8 PM | Weekly performance report posted to Telegram |
+Alerts: Telegram (`telegram_notify.py`) — buy/sell/armed/error messages plus a daily 16:05 ET heartbeat (equity, open positions, all-time stats) so silence is never ambiguous. **Outbound alerts only** — there's no interactive command bot (no `/watchlist`, `/pause` etc. via Telegram); control is via the HTTP API (`/threshold/pause`, `/threshold/resume`, `/threshold/watchlist`) or SSH.
+
+Backtesting: `backtest_threshold.py --months N --universe {watchlist,sp500} [--ai]` — reuses the exact live decision functions (not a separate reimplementation), so results reflect what the strategy actually does.
+
+Broker: Alpaca only. Bitget Stock+ was evaluated and rejected (no paper trading mode, smaller symbol coverage than Alpaca, KYC-gated real-money-only API) — see `threshold_strategy.py` docstring.
 
 ---
 
-## Telegram commands
+## Logging & health
 
-| Command | What it does |
-|---|---|
-| `/watchlist` | Today's top scored stocks |
-| `/signal NVDA` | RSI + MA status + real-time price |
-| `/chart NVDA` | Price chart with 20MA, 50MA, RSI |
-| `/positions` | Open Alpaca positions with unrealised P&L |
-| `/trades` | Trade history + win rate + P&L |
-| `/report` | This week's performance report |
-| `/report all` | Full inception-to-date report vs backtest |
-| `/pause` | Pause auto-trading |
-| `/resume` | Resume auto-trading |
-| `/stopall confirm` | Emergency: cancel all orders + liquidate all positions |
-| `/status` | Bot health, schedule, trading stats |
-| `/health` | Live connectivity check: Alpaca / yfinance / IBKR |
-| `/mywatchlist` | Manage a custom watchlist |
-| `/scanmywatchlist` | Scan your custom watchlist for signals |
-| `/portfolio` | IBKR positions (when connected) |
+- `logs/app.log` (rotating, all levels), `logs/error.log` (warnings+) — survive restarts, unlike relying on `journalctl` alone
+- `GET /logs?n=200&level=app|error` — remote log tail without SSH
+- `GET /threshold/status` — paused state, watchlist, open positions, all-time stats
 
 ---
 
-## Project structure
+## Running
 
-```
-stock-signal-bot/
-├── main.py              — Entry point, all 5 scheduled jobs (2-phase execution)
-├── scanner.py           — Morning scan + run_auto_scan() for all 503 tickers
-├── signals.py           — RSI + MA analysis, calculate_position_size(), price fetch
-├── telegram_bot.py      — All Telegram commands, channel posting, rate limiting
-├── charts.py            — Dark-mode price/RSI chart PNG
-├── watchlist.py         — Daily auto-generated watchlist (atomic JSON writes)
-├── custom_watchlist.py  — Persistent custom watchlist per user
-├── ibkr.py              — IB Gateway connection + is_connected() health check
-├── config.py            — All constants and strategy parameters — edit here only
-├── trader.py            — Market buy + trailing stop exit + circuit breakers
-├── trade_logger.py      — CSV trade log + pending queue + pause flag (atomic writes)
-├── reporter.py          — Weekly and inception-to-date performance reports
-├── backtester.py        — Swing strategy backtester (8-round framework complete)
-├── intraday_backtester.py — Intraday backtester (tested and concluded — swing wins)
-├── .env                 — API keys (never commit)
-├── requirements.txt     — Python dependencies
-├── trades.csv           — All trade records (auto-created)
-├── pending_trades.json  — Trades queued for next morning (auto-created)
-└── watchlist.json       — Daily watchlist (auto-created)
-```
+Deployed as a systemd service (`stock-signal-bot.service`) on the VPS, via git pull + `pip install -r requirements.txt` + `systemctl restart stock-signal-bot`. Not run manually / not a desktop app.
 
----
-
-## Running the bot
-
-```bash
-cd ~/Desktop/stock-signal-bot
-/Library/Developer/CommandLineTools/usr/bin/python3.9 main.py
-```
-
-> Always use Python 3.9. The system `python3` points to 3.14 which breaks python-telegram-bot 20.7.
-
-Currently running in **paper trading mode** (`PAPER_TRADING = True` in `config.py`).
-Switch to live by setting `PAPER_TRADING = False` after 6+ weeks of positive paper results.
+`config.py` — all constants and strategy parameters, edit there only. `PAPER_TRADING = True` (Alpaca paper) for both strategies currently; no live-money trading has been enabled.
 
 ---
 
@@ -153,10 +71,12 @@ Switch to live by setting `PAPER_TRADING = False` after 6+ weeks of positive pap
 
 | Component | Library |
 |---|---|
-| Language | Python 3.9 |
-| Market data | yfinance (daily), Alpaca Market Data (real-time) |
-| Indicators | ta library |
-| Order execution | alpaca-py (paper → IBKR live) |
-| Telegram | python-telegram-bot 20.7 |
+| Language | Python 3.13 |
+| Market data (price/volume/news) | Alpaca Market Data API |
+| Earnings calendar (fail-open only) | yfinance |
+| Indicators | `ta` library |
+| Order execution | alpaca-py (paper) |
+| AI sentiment | OpenAI (`gpt-4o-mini`) |
+| Alerts | Telegram Bot API (outbound only) |
 | Scheduling | APScheduler |
-| Charts | matplotlib |
+| Web framework | FastAPI + uvicorn |
