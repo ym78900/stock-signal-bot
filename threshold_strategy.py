@@ -368,8 +368,8 @@ def evaluate_exit(ticker: str, position: dict, current_price: float, rsi: Option
 
 # ── Position sizing ────────────────────────────────────────────────────────────
 
-def calculate_shares(price: float) -> int:
-    cap_dollars = config.THRESHOLD_ACCOUNT_EQUITY * config.THRESHOLD_MAX_POSITION_PCT
+def calculate_shares(price: float, account_equity: float) -> int:
+    cap_dollars = account_equity * config.THRESHOLD_MAX_POSITION_PCT
     shares = int(cap_dollars // price)
     return max(shares, 0)
 
@@ -397,6 +397,9 @@ def run_cycle() -> dict:
     if not all_tickers:
         logger.info(f"[{STRATEGY_NAME}] Watchlist is empty — nothing to do.")
         return summary
+
+    # Live account equity (not a hardcoded assumption) — used for position sizing.
+    account_equity = trader.get_account_equity() or config.THRESHOLD_ACCOUNT_EQUITY
 
     data = market_data.get_daily_bars(all_tickers, period="180d")
 
@@ -428,6 +431,11 @@ def run_cycle() -> dict:
                 positions[ticker] = position
                 summary["armed"] += 1
                 logger.info(f"[{STRATEGY_NAME}] {ticker}: exit ARMED at ${current_price:.2f} (breakeven+margin cleared)")
+                telegram_notify.send(
+                    f"📈 {ticker} exit ARMED at ${current_price:.2f} — in profit past fees, "
+                    f"now trailing {config.THRESHOLD_TRAIL_PCT}% below peak.",
+                    prefix=f"[{STRATEGY_NAME}]",
+                )
 
             elif decision["action"] == "update_peak":
                 position["peak"] = decision["peak"]
@@ -481,7 +489,7 @@ def run_cycle() -> dict:
                 if not signal:
                     continue
 
-                qty = calculate_shares(signal["price"])
+                qty = calculate_shares(signal["price"], account_equity)
                 if qty < config.THRESHOLD_MIN_SHARES:
                     logger.info(f"[{STRATEGY_NAME}] {ticker}: signal fired but position size too small, skipping.")
                     continue
@@ -512,3 +520,34 @@ def run_cycle() -> dict:
 
     logger.info(f"[{STRATEGY_NAME}] Cycle complete: {summary}")
     return summary
+
+
+def send_heartbeat() -> None:
+    """
+    Daily "still alive" summary — sent regardless of whether anything traded,
+    so silence in Telegram never means "did it crash?" the way the old
+    completely-silent pipeline did (5 days, zero trades, zero visibility).
+    """
+    try:
+        equity = trader.get_account_equity()
+        positions = load_positions()
+        stats = get_stats()
+        paused = "⏸ PAUSED" if is_paused() else "▶️ running"
+
+        lines = [
+            f"Status: {paused}",
+            f"Paper equity: ${equity:,.2f}",
+            f"Open positions: {len(positions)}",
+        ]
+        if positions:
+            for ticker, p in positions.items():
+                armed = "armed" if p.get("armed") else "not armed"
+                lines.append(f"  • {ticker}: {p['qty']}sh @ ${p['entry_price']:.2f} ({armed})")
+        lines.append(
+            f"All-time: {stats['total_trades']} trades, "
+            f"{stats['win_rate_pct']}% win rate, "
+            f"net P&L ${stats['total_net_pnl']:,.2f}"
+        )
+        telegram_notify.send("\n".join(lines), prefix=f"[{STRATEGY_NAME}] Daily summary —")
+    except Exception as e:
+        logger.error(f"[{STRATEGY_NAME}] Heartbeat failed: {e}")

@@ -88,10 +88,32 @@ def _on_startup():
             max_instances=1,
             coalesce=True,
         )
+        # Daily heartbeat — always sent, even on quiet days, so silence in
+        # Telegram never has to be interpreted as "did it crash?".
+        _scheduler.add_job(
+            ts.send_heartbeat,
+            "cron",
+            hour=21, minute=5,  # 21:05 UTC = 16:05 ET, just after the close
+            id="threshold_heartbeat",
+            max_instances=1,
+            coalesce=True,
+        )
         _scheduler.start()
         logger.info(
             f"Scheduler started — threshold strategy cycle every "
-            f"{config.THRESHOLD_CHECK_INTERVAL_MINUTES} min during market hours."
+            f"{config.THRESHOLD_CHECK_INTERVAL_MINUTES} min during market hours, "
+            f"daily heartbeat at 16:05 ET."
+        )
+        equity = None
+        try:
+            import trader
+            equity = trader.get_account_equity()
+        except Exception:
+            pass
+        telegram_notify.send(
+            f"🟢 Bot started. Watching {len(ts.load_watchlist())} tickers. "
+            + (f"Paper equity: ${equity:,.2f}." if equity else ""),
+            prefix=f"[{ts.STRATEGY_NAME}]",
         )
     except Exception as e:
         logger.error(f"Failed to start scheduler: {e}", exc_info=True)
