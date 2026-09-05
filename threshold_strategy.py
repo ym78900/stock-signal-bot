@@ -66,6 +66,7 @@ import logging
 import math
 import os
 import tempfile
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
@@ -475,8 +476,30 @@ def run_cycle() -> dict:
 
     data = market_data.get_daily_bars(all_tickers, period="180d")
 
+    # ── Reconcile any positions still awaiting fill confirmation ─────────────
+    # (order placed but didn't fill within the initial poll window — e.g.
+    # placed right before a halt, or the order is still working). Check again
+    # each cycle until confirmed; skip exit evaluation for these until then,
+    # since there's no real entry price yet to measure an exit against.
+    for ticker, position in list(positions.items()):
+        if position.get("status") != "pending_fill":
+            continue
+        order_id = position.get("alpaca_order_id")
+        real_fill = trader.get_order_fill_price(order_id) if order_id else None
+        if real_fill:
+            position["entry_price"] = real_fill
+            position["peak"] = real_fill
+            position["status"] = "open"
+            positions[ticker] = position
+            logger.info(f"[{STRATEGY_NAME}] {ticker}: fill confirmed at ${real_fill:.2f}")
+            telegram_notify.send(
+                f"✅ {ticker} fill confirmed @ ${real_fill:.2f}", prefix=f"[{STRATEGY_NAME}]"
+            )
+
     # ── Manage open positions first (exits take priority over new entries) ──
     for ticker, position in list(positions.items()):
+        if position.get("status") == "pending_fill":
+            continue  # nothing to manage yet — no confirmed entry price
         summary["checked"] += 1
         try:
             df = data.get(ticker)
@@ -581,13 +604,32 @@ def run_cycle() -> dict:
 
                 order_id = trader.place_market_buy(ticker, qty)
                 if order_id:
+                    # Poll briefly for the real fill price rather than trusting the
+                    # signal-time estimate — market orders during live trading hours
+                    # usually fill within a couple seconds, but this also protects
+                    # against the case where the order doesn't fill immediately
+                    # (e.g. placed right at a halt, or outside hours) — those stay
+                    # "pending_fill" and get reconciled on a later cycle instead of
+                    # locking in a stale/estimated entry price that could be very
+                    # wrong (confirmed bug: an order placed Saturday and left
+                    # unreconciled would carry Friday's estimated price into
+                    # Monday's actual, possibly very different, fill).
+                    real_fill = None
+                    for _ in range(5):
+                        time.sleep(1)
+                        real_fill = trader.get_order_fill_price(order_id)
+                        if real_fill:
+                            break
+
+                    entry_price = real_fill or signal["price"]
                     positions[ticker] = {
                         "qty": qty,
-                        "entry_price": signal["price"],
+                        "entry_price": entry_price,
                         "entry_date": str(date.today()),
                         "armed": False,
-                        "peak": signal["price"],
+                        "peak": entry_price,
                         "alpaca_order_id": order_id,
+                        "status": "open" if real_fill else "pending_fill",
                     }
                     summary["buys"] += 1
                     ai_note = ""
@@ -596,6 +638,8 @@ def run_cycle() -> dict:
                             f" | AI: {ai_check['ai_verdict']} "
                             f"(sentiment {ai_check['sentiment_score']:+.2f}, {ai_check['catalyst_type']})"
                         )
+                    if not real_fill:
+                        ai_note += " | ⏳ order not yet filled, entry price will be confirmed on fill"
                     telegram_notify.send_trade_alert(
                         STRATEGY_NAME, "BUY", ticker, signal["price"], signal["reason"] + ai_note
                     )
