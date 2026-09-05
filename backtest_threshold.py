@@ -63,11 +63,17 @@ def run_backtest(
     if not data:
         return {"error": "no data returned"}
 
+    # Alpaca stamps daily bars at 04:00:00 UTC (not midnight) — normalize each
+    # ticker's index to midnight so day-matching/slicing below is exact instead
+    # of silently excluding every bar's own day (confirmed bug: this originally
+    # caused zero signals to ever be evaluated, not zero signals to be found).
+    data = {t: df.set_axis(df.index.normalize()) for t, df in data.items()}
+
     # Build the unified trading-day calendar from the union of all tickers'
     # dates within the test window (start..end).
     all_dates = set()
     for df in data.values():
-        all_dates.update(pd.Timestamp(d).normalize() for d in df.index if start <= d <= end)
+        all_dates.update(d for d in df.index if start <= d <= end)
     trading_days = sorted(all_dates)
     if not trading_days:
         return {"error": "no trading days in window — check date range / data availability"}
@@ -93,7 +99,7 @@ def run_backtest(
         day_prices = {}
         for ticker, df in data.items():
             sub = df.loc[:day]
-            if sub.empty or pd.Timestamp(sub.index[-1]).normalize() != day:
+            if sub.empty or sub.index[-1] != day:
                 continue  # no bar for this ticker today (holiday gap etc.)
             day_prices[ticker] = float(sub["Close"].iloc[-1])
 
@@ -103,7 +109,7 @@ def run_backtest(
             if df is None:
                 continue
             sub = df.loc[:day]
-            if sub.empty or pd.Timestamp(sub.index[-1]).normalize() != day:
+            if sub.empty or sub.index[-1] != day:
                 continue
             price = float(sub["Close"].iloc[-1])
             rsi = _rsi(sub)
@@ -146,7 +152,7 @@ def run_backtest(
                 if ticker in positions or len(positions) >= max_open:
                     continue
                 sub = df.loc[:day]
-                if sub.empty or pd.Timestamp(sub.index[-1]).normalize() != day:
+                if sub.empty or sub.index[-1] != day:
                     continue
                 signal = ts.evaluate_entry(ticker, sub)
                 if not signal:
