@@ -144,3 +144,37 @@ NASDAQ100_WIKIPEDIA_URL   = "https://en.wikipedia.org/wiki/Nasdaq-100"
 WATCHLIST_LOW_RSI_MAX  = 45.0   # show stocks with RSI < this (approaching buy zone)
 WATCHLIST_HIGH_RSI_MIN = 60.0   # show stocks with RSI > this (approaching overbought)
 WATCHLIST_VOL_MIN      = 1.0    # minimum volume ratio for both lists (filters dry movers)
+
+# ── Market data source ────────────────────────────────────────────────────────
+# "sip" = full consolidated tape (needs paid Alpaca data plan for real-time,
+#         but historical daily bars work fine on the free tier with a 15min
+#         delay embargo lifted after time passes); "iex" = free real-time from
+#         IEX exchange only (lower coverage but truly free/real-time).
+ALPACA_DATA_FEED = "iex"
+
+# ── Telegram alerts ───────────────────────────────────────────────────────────
+# Bot token + chat id come from environment variables (.env), never hardcoded.
+TELEGRAM_ENABLED = True
+
+# ── Threshold + RSI strategy (new, simple mean-reversion module) ─────────────
+# Separate from the swing/ATR-trailing strategy above — see threshold_strategy.py
+THRESHOLD_STRATEGY_ENABLED   = True
+THRESHOLD_ACCOUNT_EQUITY     = 5000.0   # paper capital assumption for sizing
+THRESHOLD_DIP_PCT            = 5.0      # buy when price is down this % from N-day high
+THRESHOLD_DIP_LOOKBACK_DAYS  = 20       # "N-day high" window
+THRESHOLD_RSI_BUY_MAX        = 40.0     # RSI must be below this to buy
+THRESHOLD_RSI_SELL_MIN       = 65.0     # RSI above this arms/forces an exit too
+THRESHOLD_FEE_PCT_PER_SIDE   = 0.10     # exchange/broker fee % per side (0.10% = 0.001)
+THRESHOLD_MIN_PROFIT_MARGIN_PCT = 1.0   # extra cushion above breakeven-after-fees before arming exit
+THRESHOLD_TRAIL_PCT          = 2.0      # once armed, trail this % below the running peak
+THRESHOLD_HARD_STOP_PCT      = 9.0      # hard stop-loss, independent of RSI/trailing
+THRESHOLD_DISTRESS_LOOKBACK_DAYS = 126  # ~6 months
+THRESHOLD_DISTRESS_MAX_DRAWDOWN_PCT = 45.0  # skip if already down more than this over the lookback (falling-knife guard)
+THRESHOLD_MIN_AVG_VOLUME     = 200_000  # liquidity floor, same reasoning as swing bot
+THRESHOLD_PRICE_MIN          = 5.0      # same distress-price floor as swing bot
+THRESHOLD_PRICE_MAX          = 500.0    # simple bot — allow pricier names than the swing bot
+THRESHOLD_MAX_OPEN_POSITIONS = 8
+THRESHOLD_MAX_POSITION_PCT   = 0.12     # 12% of THRESHOLD_ACCOUNT_EQUITY per position, same rationale as swing bot
+THRESHOLD_MIN_SHARES         = 1
+THRESHOLD_CHECK_INTERVAL_MINUTES = 5    # how often the scheduler re-checks prices during market hours
+THRESHOLD_EARNINGS_BUFFER_DAYS = 3

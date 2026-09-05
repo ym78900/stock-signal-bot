@@ -5,10 +5,10 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, List, Dict
 import pandas as pd
-import yfinance as yf
 import ta as ta_lib
 
 import config
+import market_data
 
 logger = logging.getLogger(__name__)
 
@@ -230,43 +230,30 @@ def _strip_incomplete_session(df: pd.DataFrame) -> pd.DataFrame:
 
 def fetch_data(tickers: List[str]) -> Dict[str, pd.DataFrame]:
     """
-    Download daily OHLCV data for all tickers in one bulk request.
+    Download daily OHLCV data for all tickers in one bulk request via Alpaca.
     Results are cached to disk for the current calendar day — subsequent
     calls (e.g. /testrun) reuse the cache instead of re-downloading.
     Returns a dict: { "AAPL": DataFrame, "MSFT": DataFrame, ... }
     Only includes tickers that have sufficient data.
+
+    Previously used yfinance bulk download — replaced with Alpaca Market
+    Data API after yfinance's Yahoo cookie auth started failing constantly
+    (see market_data.py docstring for full context).
     """
     cached = _load_daily_cache()
     if cached is not None:
         return cached
 
-    logger.info(f"Downloading daily data for {len(tickers)} tickers...")
-    try:
-        raw = yf.download(
-            tickers=tickers,
-            period=config.DATA_PERIOD,
-            interval=config.DATA_INTERVAL,
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-    except Exception as e:
-        logger.error(f"yfinance download failed: {e}")
+    logger.info(f"Downloading daily data for {len(tickers)} tickers via Alpaca...")
+    raw = market_data.get_daily_bars(tickers, period=config.DATA_PERIOD)
+    if not raw:
+        logger.error("Alpaca returned no data — aborting scan.")
         return {}
 
     result = {}
-    for ticker in tickers:
+    for ticker, df in raw.items():
         try:
-            if len(tickers) == 1:
-                df = raw.copy()
-            else:
-                df = raw[ticker].copy()
-
-            # Flatten MultiIndex columns if present (newer yfinance versions)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
+            df = df.copy()
             df.dropna(how="all", inplace=True)
             df = _strip_incomplete_session(df)
 

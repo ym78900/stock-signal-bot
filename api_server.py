@@ -2,6 +2,12 @@
 Stock Signal Bot - HTTP API Server
 Serves stock scan/signal data to the iOS app as JSON endpoints, on demand.
 Auth: x-app-password header (validated against STOCK_API_PASSWORD env var).
+
+Also runs the new Threshold+RSI automated strategy on a background scheduler
+(see threshold_strategy.py) — this is the part that actually places
+unattended paper trades on a clock, which nothing in this codebase did
+before (see logging_config.py / market_data.py docstrings for the full
+context on what was broken and why).
 """
 import math
 import os
@@ -21,6 +27,9 @@ import ai_signal as ai
 import config
 import signals as sig
 import scanner as sc
+import logging_config
+import threshold_strategy as ts
+import telegram_notify
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +42,75 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_scheduler = None
+
+
+def _is_market_hours_now() -> bool:
+    now_et = datetime.now(config.TIMEZONE_ET)
+    if now_et.weekday() >= 5:
+        return False
+    open_t = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_t <= now_et <= close_t
+
+
+def _threshold_job():
+    """Scheduler entry point — wraps run_cycle with a job-level safety net so
+    one bad exception can't silently kill future scheduled runs, and so a
+    failure is never silent (Telegram alert + error log)."""
+    try:
+        if not _is_market_hours_now():
+            logger.debug("Threshold job skipped — outside US market hours.")
+            return
+        summary = ts.run_cycle()
+        if summary.get("errors"):
+            logger.warning(f"Threshold cycle finished with errors: {summary}")
+    except Exception as e:
+        logger.error(f"Threshold scheduled job crashed: {e}", exc_info=True)
+        telegram_notify.send_error_alert(ts.STRATEGY_NAME, "scheduled job crashed", str(e))
+
+
+@app.on_event("startup")
+def _on_startup():
+    global _scheduler
+    logging_config.setup_logging()
+    logger.info("API server starting up.")
+
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        _scheduler = BackgroundScheduler(timezone="UTC")
+        _scheduler.add_job(
+            _threshold_job,
+            "interval",
+            minutes=config.THRESHOLD_CHECK_INTERVAL_MINUTES,
+            id="threshold_cycle",
+            next_run_time=datetime.utcnow(),  # run once immediately on boot too
+            max_instances=1,
+            coalesce=True,
+        )
+        _scheduler.start()
+        logger.info(
+            f"Scheduler started — threshold strategy cycle every "
+            f"{config.THRESHOLD_CHECK_INTERVAL_MINUTES} min during market hours."
+        )
+    except Exception as e:
+        logger.error(f"Failed to start scheduler: {e}", exc_info=True)
+        telegram_notify.send_error_alert("System", "scheduler failed to start", str(e))
+
+
+@app.on_event("shutdown")
+def _on_shutdown():
+    if _scheduler:
+        _scheduler.shutdown(wait=False)
+
 
 class PortfolioSignalsRequest(BaseModel):
     tickers: list[str]
 
 class PortfolioTickersRequest(BaseModel):
+    tickers: list[str]
+
+class ThresholdWatchlistRequest(BaseModel):
     tickers: list[str]
 
 _API_PASSWORD = os.environ.get("STOCK_API_PASSWORD", "")
@@ -296,8 +369,89 @@ def health():
     return {"status": "ok"}
 
 
+# ── Threshold+RSI strategy endpoints ─────────────────────────────────────────
+
+@app.get("/threshold/status")
+def threshold_status(x_app_password: Optional[str] = Header(default=None)):
+    _auth(x_app_password)
+    return _sanitize({
+        "paused": ts.is_paused(),
+        "enabled": config.THRESHOLD_STRATEGY_ENABLED,
+        "watchlist": ts.load_watchlist(),
+        "positions": ts.load_positions(),
+        "stats": ts.get_stats(),
+        "check_interval_minutes": config.THRESHOLD_CHECK_INTERVAL_MINUTES,
+    })
+
+
+@app.get("/threshold/trades")
+def threshold_trades(
+    n: int = Query(default=100),
+    x_app_password: Optional[str] = Header(default=None),
+):
+    _auth(x_app_password)
+    return _sanitize({"trades": ts.get_all_trades(n)})
+
+
+@app.get("/threshold/watchlist")
+def threshold_get_watchlist(x_app_password: Optional[str] = Header(default=None)):
+    _auth(x_app_password)
+    return _sanitize({"tickers": ts.load_watchlist()})
+
+
+@app.post("/threshold/watchlist")
+def threshold_set_watchlist(
+    body: ThresholdWatchlistRequest,
+    x_app_password: Optional[str] = Header(default=None),
+):
+    _auth(x_app_password)
+    tickers = [t.upper().strip() for t in body.tickers if t.strip()]
+    ts.save_watchlist(tickers)
+    return {"status": "ok", "tickers": tickers}
+
+
+@app.post("/threshold/pause")
+def threshold_pause(x_app_password: Optional[str] = Header(default=None)):
+    _auth(x_app_password)
+    ts.pause("manual pause via API")
+    return {"status": "paused"}
+
+
+@app.post("/threshold/resume")
+def threshold_resume(x_app_password: Optional[str] = Header(default=None)):
+    _auth(x_app_password)
+    ts.resume()
+    return {"status": "resumed"}
+
+
+@app.post("/threshold/run-now")
+def threshold_run_now(x_app_password: Optional[str] = Header(default=None)):
+    """Manually trigger one strategy cycle immediately — used for testing/verification,
+    bypasses the market-hours gate the scheduler applies."""
+    _auth(x_app_password)
+    try:
+        summary = ts.run_cycle()
+        return _sanitize({"status": "ok", "summary": summary})
+    except Exception as e:
+        logger.error(f"Manual threshold run failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Logs (basic health visibility without SSH) ───────────────────────────────
+
+@app.get("/logs")
+def get_logs(
+    n: int = Query(default=200),
+    level: str = Query(default="app"),
+    x_app_password: Optional[str] = Header(default=None),
+):
+    _auth(x_app_password)
+    filename = "error.log" if level == "error" else "app.log"
+    return {"lines": logging_config.tail_log(filename, n)}
+
+
 if __name__ == "__main__":
     import dotenv
     dotenv.load_dotenv()
-    logging.basicConfig(level=logging.INFO)
+    logging_config.setup_logging()
     uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")

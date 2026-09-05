@@ -128,29 +128,13 @@ def check_spy_trend() -> Tuple[bool, float]:
     """
     Returns (safe, spy_close).
     safe=True means SPY is above 50-day MA — OK to trade.
+
+    Uses Alpaca (same client as everything else) instead of yfinance —
+    SPY is a normal tradable equity, no reason to depend on the flaky
+    Yahoo Finance scraper for this.
     """
-    try:
-        import yfinance as yf
-        spy = yf.download("SPY", period="60d", interval="1d",
-                          auto_adjust=True, progress=False)
-        if spy.empty:
-            logger.warning("SPY data unavailable — assuming safe.")
-            return True, 0.0
-        import pandas as pd
-        if isinstance(spy.columns, pd.MultiIndex):
-            spy.columns = spy.columns.get_level_values(0)
-        close = spy["Close"].dropna()
-        ma50  = close.rolling(50).mean().dropna()
-        if ma50.empty:
-            return True, 0.0
-        spy_now = float(close.iloc[-1])
-        ma_now  = float(ma50.iloc[-1])
-        safe    = spy_now >= ma_now
-        logger.info(f"SPY={spy_now:.2f}  50MA={ma_now:.2f}  safe={safe}")
-        return safe, round(spy_now, 2)
-    except Exception as e:
-        logger.error(f"SPY trend check failed: {e}")
-        return True, 0.0
+    import market_data
+    return market_data.get_spy_trend()
 
 
 def check_earnings(ticker: str) -> Tuple[bool, Optional[str]]:
@@ -233,6 +217,32 @@ def place_market_buy(ticker: str, qty: int) -> Optional[str]:
         return str(order.id)
     except Exception as e:
         logger.error(f"Failed to place market buy for {ticker}: {e}")
+        return None
+
+
+def place_market_sell(ticker: str, qty: int) -> Optional[str]:
+    """
+    Place a simple market sell (used by threshold_strategy.py's own
+    trailing-exit logic, which arms/tightens dynamically based on
+    fee-aware profit thresholds rather than a static Alpaca trailing order).
+    Returns the Alpaca order ID string, or None on failure.
+    """
+    try:
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+
+        req = MarketOrderRequest(
+            symbol        = ticker,
+            qty           = qty,
+            side          = OrderSide.SELL,
+            time_in_force = TimeInForce.DAY,
+            order_class   = OrderClass.SIMPLE,
+        )
+        order = _trading_client().submit_order(req)
+        logger.info(f"Market sell placed: {ticker} qty={qty}  id={order.id}")
+        return str(order.id)
+    except Exception as e:
+        logger.error(f"Failed to place market sell for {ticker}: {e}")
         return None
 
 

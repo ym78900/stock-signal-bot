@@ -3,10 +3,11 @@ import math
 import os
 from typing import Optional, List
 import pandas as pd
-import yfinance as yf
+import yfinance as yf  # kept only for supplementary earnings lookup (fetch_earnings_growth) — see market_data.py
 import ta as ta_lib
 
 import config
+import market_data
 
 logger = logging.getLogger(__name__)
 
@@ -113,21 +114,18 @@ def fetch_realtime_price(ticker: str) -> tuple:
 
 def fetch_ticker_data(ticker: str) -> Optional[pd.DataFrame]:
     """
-    Download daily data for a single ticker.
+    Fetch daily data for a single ticker via Alpaca Market Data API.
     Used for on-demand commands like /signal and /chart.
+
+    Previously used yfinance — switched to Alpaca after yfinance's Yahoo
+    Finance cookie auth ("crumb") started failing constantly in production,
+    silently breaking every signal check for days.
     """
     try:
-        df = yf.download(
-            tickers=ticker,
-            period=config.DATA_PERIOD,
-            interval=config.DATA_INTERVAL,
-            auto_adjust=True,
-            progress=False,
-        )
-        # Flatten MultiIndex columns if present (newer yfinance versions)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.dropna(how="all", inplace=True)
+        df = market_data.get_single_ticker_bars(ticker, period=config.DATA_PERIOD)
+        if df is None or df.empty:
+            logger.warning(f"No data returned for {ticker} from Alpaca.")
+            return None
         if len(df) < 55:
             logger.warning(f"Not enough data for {ticker} ({len(df)} rows).")
             return None
