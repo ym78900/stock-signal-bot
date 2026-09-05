@@ -89,8 +89,17 @@ def get_daily_bars(
     client = _data_client()
     result: Dict[str, pd.DataFrame] = {}
 
-    chunks = [tickers[i:i + _CHUNK_SIZE] for i in range(0, len(tickers), _CHUNK_SIZE)]
-    for chunk in chunks:
+    def _fetch_chunk(chunk: List[str], depth: int = 0) -> None:
+        """
+        Fetch one chunk; on failure (e.g. a single invalid/delisted symbol
+        poisoning the whole batch — confirmed with Alpaca: it rejects the
+        entire request rather than skipping the bad symbol), bisect and
+        retry each half so one bad ticker never costs us the other ~199
+        good ones in the same chunk. Bottoms out at single-symbol requests,
+        which are simply dropped (logged) if still failing.
+        """
+        if not chunk:
+            return
         attempt = 0
         while attempt <= retries:
             try:
@@ -104,27 +113,35 @@ def get_daily_bars(
                 bars = client.get_stock_bars(req)
                 df_all = bars.df
                 if df_all is None or df_all.empty:
-                    break
-                # df_all is MultiIndex (symbol, timestamp) when multiple symbols
+                    return
                 if isinstance(df_all.index, pd.MultiIndex):
                     for sym in chunk:
                         if sym in df_all.index.get_level_values(0):
                             sub = df_all.xs(sym, level=0).copy()
                             result[sym] = _normalize(sub)
                 else:
-                    # Single symbol in chunk
                     result[chunk[0]] = _normalize(df_all.copy())
-                break
+                return
             except Exception as e:
                 attempt += 1
                 if attempt > retries:
-                    logger.error(
-                        f"Alpaca bars fetch failed for chunk of {len(chunk)} tickers "
-                        f"after {retries} retries: {e}"
+                    if len(chunk) == 1:
+                        logger.warning(f"Alpaca bars: dropping invalid/unavailable symbol {chunk[0]}: {e}")
+                        return
+                    mid = len(chunk) // 2
+                    logger.info(
+                        f"Alpaca bars: chunk of {len(chunk)} failed after {retries} retries "
+                        f"({e}) — bisecting to isolate the bad symbol(s)."
                     )
+                    _fetch_chunk(chunk[:mid], depth + 1)
+                    _fetch_chunk(chunk[mid:], depth + 1)
+                    return
                 else:
-                    logger.warning(f"Alpaca bars fetch error (retry {attempt}/{retries}): {e}")
                     time.sleep(1.5 * attempt)
+
+    chunks = [tickers[i:i + _CHUNK_SIZE] for i in range(0, len(tickers), _CHUNK_SIZE)]
+    for chunk in chunks:
+        _fetch_chunk(chunk)
 
     logger.info(f"market_data.get_daily_bars: {len(result)}/{len(tickers)} tickers returned data.")
     return result

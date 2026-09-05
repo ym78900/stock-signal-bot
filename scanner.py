@@ -136,7 +136,7 @@ def get_nasdaq100_tickers() -> List[str]:
             if "ticker" in cols or "symbol" in cols:
                 col = "Ticker" if "Ticker" in table.columns else "Symbol"
                 tickers = table[col].dropna().tolist()
-                tickers = [t.replace(".", "-") for t in tickers if isinstance(t, str)]
+                tickers = [t for t in tickers if isinstance(t, str)]
                 _nasdaq100_cache = tickers
                 logger.info(f"Loaded {len(tickers)} NASDAQ-100 tickers.")
                 return tickers
@@ -192,8 +192,12 @@ def get_sp500_tickers() -> List[str]:
         tickers = table["Symbol"].tolist()
         names   = table["Security"].tolist()
 
-        # Some tickers on Wikipedia use a dot (e.g. BRK.B) but yfinance needs a dash (BRK-B)
-        tickers = [t.replace(".", "-") for t in tickers]
+        # Wikipedia already uses the dot notation Alpaca expects (e.g. BRK.B).
+        # Previously converted "." -> "-" for yfinance compatibility, but that
+        # actively broke these symbols on Alpaca (confirmed: Alpaca rejects
+        # "BRK-B" as invalid and needs "BRK.B") — now that yfinance is gone
+        # from this path, no conversion is needed.
+        tickers = list(tickers)
 
         _sp500_names = {t: n for t, n in zip(tickers, names)}
         _sp500_cache = tickers
