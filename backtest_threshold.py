@@ -48,6 +48,7 @@ def run_backtest(
     initial_equity: float = 5000.0,
     verbose: bool = True,
     ai_check: bool = False,
+    max_open_positions: Optional[int] = None,
 ) -> dict:
     end = pd.Timestamp.now(tz="UTC")
     start = end - timedelta(days=months * 31)
@@ -87,7 +88,7 @@ def run_backtest(
     closed_trades: List[dict] = []
     equity_curve: List[tuple] = []
     ai_checks: List[dict] = []  # every candidate the quant rules approved, with AI's verdict on it
-    max_open = config.THRESHOLD_MAX_OPEN_POSITIONS
+    max_open = max_open_positions if max_open_positions is not None else config.THRESHOLD_MAX_OPEN_POSITIONS
     fee_pct = config.THRESHOLD_FEE_PCT_PER_SIDE / 100.0
 
     if ai_check and verbose:
@@ -223,6 +224,7 @@ def run_backtest(
 
     result = {
         "period": f"{trading_days[0].date()} to {trading_days[-1].date()}",
+        "max_open_positions": max_open,
         "tickers_tested": len(data),
         "initial_equity": initial_equity,
         "final_equity": round(final_equity, 2),
@@ -295,6 +297,7 @@ def print_report(result: dict) -> None:
     print("=" * 60)
     print(f"Period:              {result['period']}")
     print(f"Tickers tested:      {result['tickers_tested']}")
+    print(f"Max open positions:  {result['max_open_positions']}")
     print("Note: earnings-date filter is DISABLED in this backtest (no historical")
     print("      earnings-calendar data source integrated — see evaluate_entry() docstring).")
     print(f"Initial equity:      ${result['initial_equity']:,.2f}")
@@ -349,6 +352,7 @@ if __name__ == "__main__":
     parser.add_argument("--universe", choices=["watchlist", "sp500"], default="watchlist")
     parser.add_argument("--equity", type=float, default=5000.0)
     parser.add_argument("--ai", action="store_true", help="Run the real AI sentiment layer on every candidate signal (makes real OpenAI + Alpaca News API calls)")
+    parser.add_argument("--max-positions", type=int, default=None, help="Override THRESHOLD_MAX_OPEN_POSITIONS for this run")
     args = parser.parse_args()
 
     if args.universe == "sp500":
@@ -362,5 +366,5 @@ if __name__ == "__main__":
               "Try --universe sp500 or set a watchlist first.")
         raise SystemExit(1)
 
-    result = run_backtest(tickers, months=args.months, initial_equity=args.equity, ai_check=args.ai)
+    result = run_backtest(tickers, months=args.months, initial_equity=args.equity, ai_check=args.ai, max_open_positions=args.max_positions)
     print_report(result)
