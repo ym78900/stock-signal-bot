@@ -426,6 +426,7 @@ def get_ai_check(ticker: str, rsi: Optional[float], as_of_date=None) -> dict:
         "catalyst_type": None,
         "ai_verdict": None,
         "ai_reasoning": None,
+        "headlines_fingerprint": None,
         "should_block": False,
         "had_news": False,
     }
@@ -465,6 +466,57 @@ def get_ai_check(ticker: str, rsi: Optional[float], as_of_date=None) -> dict:
     except Exception as e:
         logger.warning(f"[{STRATEGY_NAME}] AI check failed for {ticker} (failing open): {e}")
     return result
+
+
+# ── AI Telegram notification dedup ────────────────────────────────────────────
+# The quant entry signal (dip/RSI) re-fires every 5-minute cycle for as long as
+# a ticker stays a candidate, and get_ai_check() is called again each time —
+# so without this, an unchanged "HOLD" or "blocked" verdict spams the same
+# Telegram message every 5 minutes for hours. We only want a fresh notification
+# when something has actually changed: a new day, the verdict itself flipped
+# (can happen intraday — build_verdict() combines a once-a-day-cached AI
+# sentiment score with the *live* RSI, so crossing an RSI threshold can change
+# the verdict even with identical news), or genuinely new headlines appeared.
+AI_NOTIFICATIONS_FILE = os.path.join(BASE_DIR, "threshold_ai_notifications.json")
+
+
+def _load_ai_notifications() -> dict:
+    return _read_json(AI_NOTIFICATIONS_FILE, {})
+
+
+def _should_notify_ai(ticker: str, kind: str, verdict: Optional[str], headlines_fingerprint: Optional[str]) -> bool:
+    """
+    kind: "skip" (🤖 not-confirmed) or "block" (🚫 blocked) — tracked independently
+    per ticker so hitting the cap on one doesn't suppress the other.
+
+    Returns True (and records the new state) if this combination of
+    (today, verdict, headlines) hasn't already been notified — i.e. there's
+    something new to tell the user. Returns False if we already sent this
+    exact same verdict/headlines combo today, so the caller should log-only.
+    """
+    key = f"{ticker.upper()}:{kind}"
+    state = _load_ai_notifications()
+    today_iso = date.today().isoformat()
+    prev = state.get(key)
+
+    if (
+        prev is not None
+        and prev.get("date") == today_iso
+        and prev.get("verdict") == verdict
+        and prev.get("headlines_fingerprint") == headlines_fingerprint
+    ):
+        return False
+
+    state[key] = {
+        "date": today_iso,
+        "verdict": verdict,
+        "headlines_fingerprint": headlines_fingerprint,
+    }
+    try:
+        _atomic_json_write(AI_NOTIFICATIONS_FILE, state)
+    except Exception as e:
+        logger.warning(f"[{STRATEGY_NAME}] Failed to persist AI notification state for {ticker}: {e}")
+    return True
 
 
 # ── Broker-side stop-loss safety net ──────────────────────────────────────────
@@ -817,10 +869,13 @@ def run_cycle() -> dict:
                         f"(sentiment={ai_check['sentiment_score']}, verdict={ai_check['ai_verdict']}) "
                         f"— {ai_check['ai_reasoning']}"
                     )
-                    telegram_notify.send(
-                        f"🚫 {ticker} BUY signal blocked by AI — {ai_check['ai_reasoning'] or 'flagged as high risk'}",
-                        prefix=f"[{STRATEGY_NAME}]",
-                    )
+                    if _should_notify_ai(ticker, "block", ai_check["ai_verdict"], ai_check["headlines_fingerprint"]):
+                        telegram_notify.send(
+                            f"🚫 {ticker} BUY signal blocked by AI — {ai_check['ai_reasoning'] or 'flagged as high risk'}",
+                            prefix=f"[{STRATEGY_NAME}]",
+                        )
+                    else:
+                        logger.info(f"[{STRATEGY_NAME}] {ticker}: suppressing repeat 'blocked by AI' Telegram message (unchanged verdict/news today).")
                     continue
 
                 # Phase 3: require the AI to actively agree (BUY/STRONG BUY), not just
@@ -832,11 +887,14 @@ def run_cycle() -> dict:
                         f"[{STRATEGY_NAME}] {ticker}: BUY signal skipped — AI did not confirm "
                         f"(verdict={ai_check['ai_verdict']}, sentiment={ai_check['sentiment_score']})"
                     )
-                    telegram_notify.send(
-                        f"🤖 {ticker} BUY signal skipped — AI verdict: {ai_check['ai_verdict'] or 'no news found'} "
-                        f"(not BUY/STRONG BUY)" + (f" — {ai_check['ai_reasoning']}" if ai_check["ai_reasoning"] else ""),
-                        prefix=f"[{STRATEGY_NAME}]",
-                    )
+                    if _should_notify_ai(ticker, "skip", ai_check["ai_verdict"], ai_check["headlines_fingerprint"]):
+                        telegram_notify.send(
+                            f"🤖 {ticker} BUY signal skipped — AI verdict: {ai_check['ai_verdict'] or 'no news found'} "
+                            f"(not BUY/STRONG BUY)" + (f" — {ai_check['ai_reasoning']}" if ai_check["ai_reasoning"] else ""),
+                            prefix=f"[{STRATEGY_NAME}]",
+                        )
+                    else:
+                        logger.info(f"[{STRATEGY_NAME}] {ticker}: suppressing repeat 'skipped — AI verdict' Telegram message (unchanged verdict/news today).")
                     continue
 
                 order_id = trader.place_market_buy_notional(ticker, position_dollars)

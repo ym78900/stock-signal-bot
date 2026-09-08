@@ -14,3 +14,6 @@ __pycache__/
 
 ai_sentiment_cache.json
 portfolio_tickers.json
+threshold_watchlist.json
+threshold_positions.json
+threshold_ai_notifications.json

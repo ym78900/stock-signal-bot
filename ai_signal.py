@@ -12,6 +12,7 @@ not a scraper — replaced an unofficial Finviz scraper for the same
 reliability reasoning as the yfinance->Alpaca migration for price data.
 """
 
+import hashlib
 import json
 import os
 from datetime import date, datetime
@@ -132,6 +133,16 @@ def build_verdict(rsi: Optional[float], sentiment: Optional[dict]) -> dict:
     return {"ai_verdict": verdict, "ai_reasoning": reasoning}
 
 
+def headlines_fingerprint(headlines: list[dict]) -> Optional[str]:
+    """Stable hash of the current headline set (by title+url), so callers can
+    detect "new information arrived since we last notified" without having to
+    compare full headline lists. Returns None if there are no headlines."""
+    if not headlines:
+        return None
+    keys = sorted(f"{h.get('title', '')}|{h.get('url', '')}" for h in headlines)
+    return hashlib.sha256("\n".join(keys).encode("utf-8")).hexdigest()[:16]
+
+
 def get_ai_enrichment(
     ticker: str,
     company_name: Optional[str],
@@ -151,17 +162,20 @@ def get_ai_enrichment(
         "catalyst_type": None,
         "ai_verdict": None,
         "ai_reasoning": None,
+        "headlines_fingerprint": None,
     }
     try:
         end_dt = datetime.combine(as_of_date, datetime.min.time()) if as_of_date else None
         headlines = market_data.get_recent_news(ticker, end_date=end_dt)
+        fingerprint = headlines_fingerprint(headlines)
         sentiment = analyze_sentiment(ticker, company_name, headlines, as_of_date=as_of_date)
         if sentiment is None:
-            return defaults
+            return {**defaults, "headlines_fingerprint": fingerprint}
         return {
             "sentiment_score": sentiment.get("sentiment_score"),
             "confidence_score": sentiment.get("confidence_score"),
             "catalyst_type": sentiment.get("catalyst_type"),
+            "headlines_fingerprint": fingerprint,
             **build_verdict(rsi, sentiment),
         }
     except Exception:
