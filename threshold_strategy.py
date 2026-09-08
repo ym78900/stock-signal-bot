@@ -266,7 +266,9 @@ def _distress_check(df) -> tuple:
     return True, None
 
 
-def evaluate_entry(ticker: str, df, check_earnings: bool = True) -> Optional[dict]:
+def evaluate_entry(
+    ticker: str, df, check_earnings: bool = True, require_ma_trend: bool = False,
+) -> Optional[dict]:
     """
     Return a dict describing the BUY signal if all entry conditions are met, else None.
 
@@ -276,6 +278,15 @@ def evaluate_entry(ticker: str, df, check_earnings: bool = True) -> Optional[dic
     historical earnings-calendar data source integrated yet). Rather than
     silently produce a filter that's checking the wrong date, backtests skip
     this filter entirely and say so.
+
+    require_ma_trend: EXPERIMENTAL, default False (no effect on live trading
+    unless explicitly turned on) — added to A/B test a 20MA > 50MA "don't
+    dip-buy into a structural downtrend" filter (config.MA_FAST/MA_SLOW,
+    same constants the separate swing bot's signals.py already uses for its
+    own crossover logic). Pure historical price data — no look-ahead-bias
+    risk, unlike the EPS-growth idea also floated (rejected for backtesting:
+    yfinance only exposes a live snapshot, not a historical time series, so
+    there's no way to backtest that one honestly).
     """
     try:
         if len(df) < max(config.THRESHOLD_DIP_LOOKBACK_DAYS, config.RSI_PERIOD) + 5:
@@ -312,6 +323,21 @@ def evaluate_entry(ticker: str, df, check_earnings: bool = True) -> Optional[dic
             logger.info(f"[{STRATEGY_NAME}] {ticker}: skipped — {reason}")
             return None
 
+        # EXPERIMENTAL: 20MA > 50MA trend filter (off by default — see
+        # require_ma_trend docstring above). Always computed (cheap, already
+        # have the price series) and returned in the signal dict for
+        # analysis, even when not used to block entry.
+        ma_fast = ma_slow = None
+        if len(df) >= config.MA_SLOW:
+            ma_fast_series = df["Close"].rolling(window=config.MA_FAST).mean().dropna()
+            ma_slow_series = df["Close"].rolling(window=config.MA_SLOW).mean().dropna()
+            if not ma_fast_series.empty and not ma_slow_series.empty:
+                ma_fast = float(ma_fast_series.iloc[-1])
+                ma_slow = float(ma_slow_series.iloc[-1])
+        if require_ma_trend:
+            if ma_fast is None or ma_slow is None or ma_fast <= ma_slow:
+                return None
+
         # Best-effort earnings check (never blocks on failure). Skipped
         # entirely in backtests — see check_earnings param docstring above.
         if check_earnings:
@@ -328,6 +354,8 @@ def evaluate_entry(ticker: str, df, check_earnings: bool = True) -> Optional[dic
             "price": round(price, 2),
             "dip_pct": round(dip_pct, 2),
             "rsi": round(rsi, 1),
+            "ma_fast": round(ma_fast, 2) if ma_fast is not None else None,
+            "ma_slow": round(ma_slow, 2) if ma_slow is not None else None,
             "reason": f"dip -{dip_pct:.1f}% from {config.THRESHOLD_DIP_LOOKBACK_DAYS}d high, RSI {rsi:.1f}",
         }
     except Exception as e:
@@ -616,6 +644,35 @@ def run_cycle() -> dict:
                 f"✅ {ticker} fill confirmed @ ${real_fill:.2f} x {real_qty:.4f} shares",
                 prefix=f"[{STRATEGY_NAME}]",
             )
+            continue
+
+        # Not filled — check whether Alpaca has already given up on this
+        # order (expired/canceled/rejected) rather than silently polling
+        # forever. Previously nothing checked this at all: a buy order that
+        # never filled (e.g. TIF=DAY expiry with no fill, or a rejection)
+        # would leave a permanent "ghost" position here — never managed,
+        # never cleared, never reported — with no cash ever freed up.
+        status_info = trader.get_order_status_and_expiry(order_id) if order_id else None
+        status, expires_at = status_info if status_info else (None, None)
+        if status in ("expired", "canceled", "cancelled", "rejected"):
+            del positions[ticker]
+            logger.warning(f"[{STRATEGY_NAME}] {ticker}: entry order {order_id} never filled (status={status}) — position dropped.")
+            telegram_notify.send(
+                f"⚠️ {ticker} buy order never filled (status={status}) — removed from tracking, no position opened.",
+                prefix=f"[{STRATEGY_NAME}]",
+            )
+        elif expires_at and datetime.now(expires_at.tzinfo) > expires_at:
+            # Safety-net backstop: Alpaca still shows it "open"/"accepted"
+            # past its own expiry (shouldn't normally happen — Alpaca expires
+            # DAY orders itself — but don't leave shares/cash committed to a
+            # stale order indefinitely if it does).
+            trader.cancel_order(order_id)
+            del positions[ticker]
+            logger.warning(f"[{STRATEGY_NAME}] {ticker}: entry order {order_id} was still open past its expiry ({expires_at}) — cancelled and position dropped.")
+            telegram_notify.send(
+                f"⚠️ {ticker} buy order was stuck open past its expiry — cancelled, no position opened.",
+                prefix=f"[{STRATEGY_NAME}]",
+            )
 
     # ── Manage open positions first (exits take priority over new entries) ──
     for ticker, position in list(positions.items()):
@@ -762,6 +819,22 @@ def run_cycle() -> dict:
                     )
                     telegram_notify.send(
                         f"🚫 {ticker} BUY signal blocked by AI — {ai_check['ai_reasoning'] or 'flagged as high risk'}",
+                        prefix=f"[{STRATEGY_NAME}]",
+                    )
+                    continue
+
+                # Phase 3: require the AI to actively agree (BUY/STRONG BUY), not just
+                # fail to flag it as AVOID. HOLD, SELL, or no news at all now skip the
+                # trade too — see config.py comment on THRESHOLD_AI_REQUIRE_BUY_CONFIRMATION
+                # for the backtest data behind this (beat blocking-only on every metric).
+                if config.THRESHOLD_AI_REQUIRE_BUY_CONFIRMATION and ai_check["ai_verdict"] not in ("BUY", "STRONG BUY"):
+                    logger.info(
+                        f"[{STRATEGY_NAME}] {ticker}: BUY signal skipped — AI did not confirm "
+                        f"(verdict={ai_check['ai_verdict']}, sentiment={ai_check['sentiment_score']})"
+                    )
+                    telegram_notify.send(
+                        f"🤖 {ticker} BUY signal skipped — AI verdict: {ai_check['ai_verdict'] or 'no news found'} "
+                        f"(not BUY/STRONG BUY)" + (f" — {ai_check['ai_reasoning']}" if ai_check["ai_reasoning"] else ""),
                         prefix=f"[{STRATEGY_NAME}]",
                     )
                     continue

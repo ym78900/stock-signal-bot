@@ -49,6 +49,8 @@ def run_backtest(
     verbose: bool = True,
     ai_check: bool = False,
     max_open_positions: Optional[int] = None,
+    require_ma_trend: bool = False,
+    require_ai_buy: bool = False,
 ) -> dict:
     end = pd.Timestamp.now(tz="UTC")
     start = end - timedelta(days=months * 31)
@@ -88,10 +90,11 @@ def run_backtest(
     closed_trades: List[dict] = []
     equity_curve: List[tuple] = []
     ai_checks: List[dict] = []  # every candidate the quant rules approved, with AI's verdict on it
+    skipped_no_ai_confirmation: List[dict] = []  # only populated when require_ai_buy=True
     max_open = max_open_positions if max_open_positions is not None else config.THRESHOLD_MAX_OPEN_POSITIONS
     fee_pct = config.THRESHOLD_FEE_PCT_PER_SIDE / 100.0
 
-    if ai_check and verbose:
+    if (ai_check or require_ai_buy) and verbose:
         print("AI mode: calling the real sentiment layer (Alpaca News + gpt-4o-mini) "
               "for every signal the quant rules approve — this makes real, tiny OpenAI API calls.")
 
@@ -161,7 +164,7 @@ def run_backtest(
                 sub = df.loc[:day]
                 if sub.empty or sub.index[-1] != day:
                     continue
-                signal = ts.evaluate_entry(ticker, sub, check_earnings=False)
+                signal = ts.evaluate_entry(ticker, sub, check_earnings=False, require_ma_trend=require_ma_trend)
                 if not signal:
                     continue
                 position_dollars = ts.calculate_position_dollars(equity_estimate)
@@ -172,9 +175,9 @@ def run_backtest(
                 if cost > cash:
                     continue
 
-                if ai_check:
+                if ai_check or require_ai_buy:
                     ai_result = ts.get_ai_check(ticker, signal.get("rsi"), as_of_date=day.date())
-                    ai_checks.append({
+                    ai_record = {
                         "ticker": ticker,
                         "entry_date": str(day.date()),
                         "entry_price": signal["price"],
@@ -182,7 +185,17 @@ def run_backtest(
                             "sentiment_score", "confidence_score", "catalyst_type",
                             "ai_verdict", "ai_reasoning", "should_block", "had_news",
                         )},
-                    })
+                    }
+                    if ai_check:
+                        ai_checks.append(ai_record)
+
+                    if require_ai_buy and ai_result.get("ai_verdict") not in ("BUY", "STRONG BUY"):
+                        # AI didn't confirm the quant dip-buy — skip this candidate
+                        # entirely (real skip, not post-hoc subtraction), so the
+                        # freed-up capital/slot is available to the next candidate,
+                        # same as a genuine alternate-history run would behave.
+                        skipped_no_ai_confirmation.append(ai_record)
+                        continue
 
                 cash -= cost
                 positions[ticker] = {
@@ -225,6 +238,8 @@ def run_backtest(
     result = {
         "period": f"{trading_days[0].date()} to {trading_days[-1].date()}",
         "max_open_positions": max_open,
+        "require_ma_trend": require_ma_trend,
+        "require_ai_buy": require_ai_buy,
         "tickers_tested": len(data),
         "initial_equity": initial_equity,
         "final_equity": round(final_equity, 2),
@@ -285,6 +300,31 @@ def run_backtest(
             "blocked_losses": sum(1 for b in blocked_with_outcome if b["win"] is False),
         }
 
+    # ── AI-confirmation-required mode: what got skipped and why ───────────────
+    # Unlike ai_summary above (post-hoc approximation on top of the baseline
+    # run's actual trades), this reflects a REAL alternate simulation — every
+    # skipped candidate here genuinely never became a position, so its slot/
+    # capital was already available to whatever the sim evaluated next. We
+    # still resolve "what would this candidate have done" for context only,
+    # by peeking at the raw price series past entry (independent of the sim's
+    # actual position bookkeeping, since it was never opened).
+    if require_ai_buy and skipped_no_ai_confirmation:
+        skipped_with_context = []
+        for a in skipped_no_ai_confirmation:
+            df = data.get(a["ticker"])
+            note = "unknown"
+            if df is not None:
+                future = df.loc[df.index > pd.Timestamp(a["entry_date"], tz="UTC")]
+                if not future.empty:
+                    price_10d_later = float(future["Close"].iloc[min(9, len(future) - 1)])
+                    pct_move = round((price_10d_later - a["entry_price"]) / a["entry_price"] * 100, 2)
+                    note = f"{pct_move:+.2f}% over next {min(10, len(future))} trading days"
+            skipped_with_context.append({**a, "price_context": note})
+        result["ai_buy_confirmation_summary"] = {
+            "skipped_count": len(skipped_no_ai_confirmation),
+            "skipped_candidates": skipped_with_context,
+        }
+
     return result
 
 
@@ -298,6 +338,8 @@ def print_report(result: dict) -> None:
     print(f"Period:              {result['period']}")
     print(f"Tickers tested:      {result['tickers_tested']}")
     print(f"Max open positions:  {result['max_open_positions']}")
+    print(f"Require MA20>MA50:   {result.get('require_ma_trend', False)}")
+    print(f"Require AI BUY/STRONG BUY to enter: {result.get('require_ai_buy', False)}")
     print("Note: earnings-date filter is DISABLED in this backtest (no historical")
     print("      earnings-calendar data source integrated — see evaluate_entry() docstring).")
     print(f"Initial equity:      ${result['initial_equity']:,.2f}")
@@ -342,6 +384,18 @@ def print_report(result: dict) -> None:
                   f"— actual net P&L ${b['net_pnl']:+.2f}")
     print("=" * 60 + "\n")
 
+    if "ai_buy_confirmation_summary" in result:
+        s = result["ai_buy_confirmation_summary"]
+        print("-" * 60)
+        print("AI-CONFIRMATION-REQUIRED MODE — skipped candidates (quant said BUY, AI didn't)")
+        print("-" * 60)
+        print(f"Skipped (no BUY/STRONG BUY from AI): {s['skipped_count']}")
+        for a in s["skipped_candidates"]:
+            print(f"  [SKIPPED] {a['ticker']:6s} {a['entry_date']} @ ${a['entry_price']:.2f} — "
+                  f"AI: {a['ai_verdict']} (sentiment {a['sentiment_score']}, {a['catalyst_type']}) — "
+                  f"would've moved {a['price_context']}")
+        print("=" * 60 + "\n")
+
 
 if __name__ == "__main__":
     import dotenv
@@ -353,6 +407,8 @@ if __name__ == "__main__":
     parser.add_argument("--equity", type=float, default=5000.0)
     parser.add_argument("--ai", action="store_true", help="Run the real AI sentiment layer on every candidate signal (makes real OpenAI + Alpaca News API calls)")
     parser.add_argument("--max-positions", type=int, default=None, help="Override THRESHOLD_MAX_OPEN_POSITIONS for this run")
+    parser.add_argument("--ma-trend", action="store_true", help="EXPERIMENTAL: require 20MA > 50MA (config.MA_FAST/MA_SLOW) at entry — skip dip-buys into a structural downtrend")
+    parser.add_argument("--require-ai-buy", action="store_true", help="Only enter a position if the AI verdict is BUY or STRONG BUY (real alternate-history simulation, not post-hoc — makes real OpenAI + Alpaca News API calls, same as --ai)")
     args = parser.parse_args()
 
     if args.universe == "sp500":
@@ -366,5 +422,5 @@ if __name__ == "__main__":
               "Try --universe sp500 or set a watchlist first.")
         raise SystemExit(1)
 
-    result = run_backtest(tickers, months=args.months, initial_equity=args.equity, ai_check=args.ai, max_open_positions=args.max_positions)
+    result = run_backtest(tickers, months=args.months, initial_equity=args.equity, ai_check=args.ai, max_open_positions=args.max_positions, require_ma_trend=args.ma_trend, require_ai_buy=args.require_ai_buy)
     print_report(result)

@@ -235,3 +235,22 @@ THRESHOLD_AI_BLOCK_CATALYSTS = ["Lawsuit/Regulatory"]  # only these catalyst typ
 THRESHOLD_AI_AVOID_SENTIMENT = -0.5      # sentiment_score at/below this + high confidence = block
 THRESHOLD_AI_MIN_CONFIDENCE_TO_BLOCK = 0.6
 THRESHOLD_AI_MIN_CONFIDENCE_TO_BLOCK = 0.6
+
+# Phase 3 (THRESHOLD_AI_REQUIRE_BUY_CONFIRMATION): instead of only blocking on
+# AVOID, require the AI verdict to actively agree (BUY or STRONG BUY) before
+# taking a quant-approved dip-buy at all. Everything else (HOLD, SELL, AVOID,
+# or no news found at all) skips the trade.
+#
+# 3-month S&P 500 backtest (backtest_threshold.py --require-ai-buy, Sept 2026),
+# same window/universe as the blocking-only backtest above:
+#   Current implementation (blocking-only):        +7.92% return, 194 trades,
+#     58.2% win rate, 6.98% max drawdown, +$451.12 realized P&L.
+#   Require AI BUY/STRONG BUY to enter:             +9.10% return, 185 trades,
+#     59.5% win rate, 5.54% max drawdown, +$486.67 realized P&L.
+#   Requiring AI confirmation beat blocking-only on every metric this sample —
+#   skipped 295 quant-approved candidates that AI didn't actively confirm
+#   (mostly HOLD or no news), including the exact live case that prompted this
+#   (NKE, AI: HOLD, bought anyway under blocking-only logic).
+#   Same caveats as the blocking backtest above apply (single 3-month window,
+#   generally rising market, daily bars only) — re-verify periodically.
+THRESHOLD_AI_REQUIRE_BUY_CONFIRMATION = True
