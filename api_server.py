@@ -30,6 +30,7 @@ import scanner as sc
 import logging_config
 import threshold_strategy as ts
 import telegram_notify
+import trader
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +45,55 @@ app.add_middleware(
 
 _scheduler = None
 
+# Cache of Alpaca's calendar answer per date — {date(): (open_dt, close_dt) or None}.
+# Avoids hitting Alpaca's calendar endpoint on every 5-minute tick; there's only
+# ever one answer per calendar day, so a single lookup per day is enough.
+_calendar_cache: dict = {}
+
+
+def _market_session_for(day) -> Optional[tuple]:
+    """
+    Return (open_dt, close_dt) — both tz-aware in America/New_York — for the
+    given date if it's a real NYSE trading day, else None (weekend or market
+    holiday, e.g. Labor Day, Thanksgiving, etc.).
+
+    Uses Alpaca's own /v2/calendar endpoint (the actual source of truth the
+    broker itself uses to decide when DAY orders execute/expire) rather than
+    a hardcoded holiday list or day-of-week guess — this is what previously
+    caused the scheduler to run full live-trading cycles (including real
+    order placement) on market holidays that happened to fall on a weekday.
+    """
+    if day in _calendar_cache:
+        return _calendar_cache[day]
+    try:
+        from alpaca.trading.requests import GetCalendarRequest
+
+        req = GetCalendarRequest(start=day, end=day)
+        entries = trader._trading_client().get_calendar(req)
+        if not entries:
+            _calendar_cache[day] = None
+            return None
+        entry = entries[0]
+        # entry.open/entry.close are already naive datetimes (date+time
+        # combined) in exchange-local time — just attach the tzinfo.
+        open_dt = config.TIMEZONE_ET.localize(entry.open)
+        close_dt = config.TIMEZONE_ET.localize(entry.close)
+        _calendar_cache[day] = (open_dt, close_dt)
+        return _calendar_cache[day]
+    except Exception as e:
+        # Fail CLOSED here, not open — if we can't confirm the market is
+        # actually open, skipping a cycle is far safer than placing real
+        # orders on a day we're not sure about (e.g. an unrecognized holiday).
+        logger.error(f"Market calendar lookup failed for {day}: {e} — treating as closed.")
+        return None
+
 
 def _is_market_hours_now() -> bool:
     now_et = datetime.now(config.TIMEZONE_ET)
-    if now_et.weekday() >= 5:
+    session = _market_session_for(now_et.date())
+    if session is None:
         return False
-    open_t = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    close_t = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    open_t, close_t = session
     return open_t <= now_et <= close_t
 
 
@@ -75,6 +118,28 @@ def _on_startup():
     global _scheduler
     logging_config.setup_logging()
     logger.info("API server starting up.")
+
+    # Warm up alpaca-py's lazily-imported submodules synchronously, on the
+    # main thread, BEFORE starting the background scheduler. Without this,
+    # the scheduler's immediate boot-time job (next_run_time=now) runs in its
+    # own thread at roughly the same moment this function's own equity check
+    # below also triggers the first-ever import of alpaca.trading.client —
+    # two threads racing to import the same module for the first time can
+    # deadlock in CPython's import lock (confirmed: this exact deadlock
+    # happened in testing). Importing once here, single-threaded, before any
+    # other thread touches these modules, avoids the race entirely.
+    try:
+        from alpaca.trading.client import TradingClient  # noqa: F401
+        from alpaca.trading.requests import (  # noqa: F401
+            MarketOrderRequest, StopOrderRequest, TrailingStopOrderRequest,
+            GetOrdersRequest, GetCalendarRequest,
+        )
+        from alpaca.trading.enums import (  # noqa: F401
+            OrderSide, TimeInForce, OrderClass, QueryOrderStatus,
+        )
+        from alpaca.data.historical import StockHistoricalDataClient  # noqa: F401
+    except Exception as e:
+        logger.warning(f"alpaca-py warmup import failed (non-fatal, may still race later): {e}")
 
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
@@ -106,7 +171,6 @@ def _on_startup():
         )
         equity = None
         try:
-            import trader
             equity = trader.get_account_equity()
         except Exception:
             pass

@@ -35,6 +35,25 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def _status_str(status) -> str:
+    """
+    Normalize an Alpaca order/leg `.status` field to a plain lowercase string
+    ("filled", "accepted", "expired", ...).
+
+    IMPORTANT: alpaca-py's OrderStatus is a (str, Enum) hybrid whose __str__
+    returns "OrderStatus.FILLED" (the Enum default repr-ish format), NOT the
+    plain value "filled" — even though the object itself IS equal to the
+    plain string via __eq__ (OrderStatus.FILLED == "filled" is True). Every
+    status check in this file used to do `str(order.status).lower()`, which
+    produces "orderstatus.filled" and therefore NEVER matched "filled",
+    "accepted", etc. — meaning fills, cancellations, and expiries were never
+    actually detected anywhere in this file. Confirmed bug, fixed by using
+    `.value` (or falling back to str() for the rare case status is already a
+    plain string, e.g. from a mocked/older client).
+    """
+    return str(getattr(status, "value", status)).lower()
+
+
 # ── Alpaca client factory ─────────────────────────────────────────────────────
 
 def _trading_client():
@@ -295,7 +314,7 @@ def get_order_fill_price(order_id: str) -> Optional[float]:
     """
     try:
         order  = _trading_client().get_order_by_id(order_id)
-        status = str(order.status).lower()
+        status = _status_str(order.status)
         if status in ("filled", "partially_filled") and order.filled_avg_price:
             return round(float(order.filled_avg_price), 4)
         return None
@@ -312,7 +331,7 @@ def get_order_fill_details(order_id: str) -> Optional[Tuple[float, float]]:
     """
     try:
         order  = _trading_client().get_order_by_id(order_id)
-        status = str(order.status).lower()
+        status = _status_str(order.status)
         if status in ("filled", "partially_filled") and order.filled_avg_price and order.filled_qty:
             return round(float(order.filled_avg_price), 4), float(order.filled_qty)
         return None
@@ -371,9 +390,24 @@ def get_order_status(order_id: str) -> Optional[str]:
     """Return the raw lowercase order status string, or None if not found/error."""
     try:
         order = _trading_client().get_order_by_id(order_id)
-        return str(order.status).lower()
+        return _status_str(order.status)
     except Exception as e:
         logger.debug(f"get_order_status({order_id}): {e}")
+        return None
+
+
+def get_order_status_and_expiry(order_id: str) -> Optional[Tuple[str, Optional[datetime]]]:
+    """
+    Return (lowercase status, expires_at) for an order, or None on error.
+    Used as a safety net to proactively cancel an order Alpaca still shows as
+    open/working past its own expiry time (clock-skew / edge-case backstop —
+    normally Alpaca itself expires DAY orders without us needing to act).
+    """
+    try:
+        order = _trading_client().get_order_by_id(order_id)
+        return _status_str(order.status), order.expires_at
+    except Exception as e:
+        logger.debug(f"get_order_status_and_expiry({order_id}): {e}")
         return None
 
 
@@ -487,7 +521,7 @@ def get_closed_bracket_legs(tracked_order_ids: List[str]) -> List[dict]:
         for order_id in tracked_order_ids:
             try:
                 order = client.get_order_by_id(order_id)
-                status = str(order.status).lower()
+                status = _status_str(order.status)
                 order_type = str(getattr(order, "order_type", "") or "").lower()
 
                 # ── Standalone trailing stop (our new approach) ───────────────
@@ -505,7 +539,7 @@ def get_closed_bracket_legs(tracked_order_ids: List[str]) -> List[dict]:
                 # ── OCO/bracket legs (legacy fallback) ────────────────────────
                 legs = getattr(order, "legs", None) or []
                 for leg in legs:
-                    leg_status = str(leg.status).lower()
+                    leg_status = _status_str(leg.status)
                     if leg_status == "filled" and leg.filled_avg_price:
                         exit_price  = round(float(leg.filled_avg_price), 4)
                         exit_reason = _map_exit_reason(leg)
@@ -550,7 +584,7 @@ def get_filled_entries(tracked_order_ids: List[str]) -> List[dict]:
         for order_id in tracked_order_ids:
             try:
                 order = client.get_order_by_id(order_id)
-                status = str(order.status).lower()
+                status = _status_str(order.status)
                 # Parent order filled = entry executed
                 if status in ("filled", "partially_filled") and order.filled_avg_price:
                     filled.append({
